@@ -2,9 +2,12 @@ import streamlit as st
 
 from db import run_query
 from branding import aplicar_logo
+from auth import exigir_login, botao_logout
 
 st.set_page_config(page_title="Cadastros", page_icon="assets/icone_coracao.png", layout="wide")
 aplicar_logo()
+exigir_login()
+botao_logout()
 st.title("Cadastros")
 st.caption("Catálogos usados nas outras telas do sistema.")
 
