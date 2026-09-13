@@ -75,6 +75,36 @@ st.metric("Resultado líquido do período", f"R$ {resultado_liquido:.2f}")
 st.caption(f"Descontos concedidos no período: R$ {float(receita_resumo['descontos']):.2f}")
 
 # ------------------------------------------------------------
+# Receita histórica (planilha migrada, sem custo/despesa registrados)
+# ------------------------------------------------------------
+
+historico_resumo = run_query(
+    """
+    SELECT COUNT(*) AS qtd, COALESCE(SUM(valor), 0) AS total
+    FROM venda_historica
+    WHERE data_venda BETWEEN %s AND %s
+    """,
+    (data_inicio, data_fim),
+)[0]
+
+receita_historica = float(historico_resumo["total"])
+receita_total_periodo = receita_liquida + receita_historica
+
+st.divider()
+col1, col2 = st.columns(2)
+col1.metric(
+    "Receita histórica (planilha migrada)",
+    f"R$ {receita_historica:.2f}",
+    f"{historico_resumo['qtd']} venda(s)",
+)
+col2.metric("Receita total do período", f"R$ {receita_total_periodo:.2f}")
+st.caption(
+    "A receita histórica veio da planilha antiga e não tem custo de peça nem "
+    "despesa associada registrados — por isso a margem bruta e o resultado "
+    "líquido acima consideram só as vendas feitas dentro do sistema."
+)
+
+# ------------------------------------------------------------
 # Situação de contas em aberto (independe do período escolhido)
 # ------------------------------------------------------------
 
@@ -120,9 +150,12 @@ with col1:
         """,
         (data_inicio, data_fim),
     )
-    if receita_por_tipo:
-        df_receita = pd.DataFrame(receita_por_tipo).set_index("conta")
-        df_receita["total"] = df_receita["total"].astype(float)
+    if receita_por_tipo or receita_historica:
+        df_receita = pd.DataFrame(receita_por_tipo).set_index("conta") if receita_por_tipo else pd.DataFrame(columns=["total"])
+        if not df_receita.empty:
+            df_receita["total"] = df_receita["total"].astype(float)
+        if receita_historica:
+            df_receita.loc["Histórico (migrado)"] = receita_historica
         st.bar_chart(df_receita["total"])
     else:
         st.info("Sem vendas no período.")
@@ -180,12 +213,25 @@ cpv_mensal = run_query(
     GROUP BY 1 ORDER BY 1
     """
 )
+receita_historica_mensal = run_query(
+    """
+    SELECT date_trunc('month', data_venda)::date AS mes, COALESCE(SUM(valor), 0) AS receita_historica
+    FROM venda_historica
+    WHERE data_venda >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+    GROUP BY 1 ORDER BY 1
+    """
+)
 
 meses_idx = pd.period_range(end=pd.Timestamp(hoje).to_period("M"), periods=6, freq="M")
 tendencia = pd.DataFrame(index=meses_idx)
 tendencia.index.name = "mes"
 
-for dados, coluna in [(receita_mensal, "receita"), (despesas_mensal, "despesas"), (cpv_mensal, "cpv")]:
+for dados, coluna in [
+    (receita_mensal, "receita"),
+    (despesas_mensal, "despesas"),
+    (cpv_mensal, "cpv"),
+    (receita_historica_mensal, "receita_historica"),
+]:
     if dados:
         serie = (
             pd.DataFrame(dados)
@@ -198,10 +244,17 @@ for dados, coluna in [(receita_mensal, "receita"), (despesas_mensal, "despesas")
         tendencia[coluna] = 0.0
 
 tendencia = tendencia.fillna(0.0)
+tendencia["receita"] = tendencia["receita"] + tendencia["receita_historica"]
 tendencia["resultado"] = tendencia["receita"] - tendencia["cpv"] - tendencia["despesas"]
 tendencia.index = tendencia.index.strftime("%b/%Y")
 
 st.bar_chart(tendencia[["receita", "despesas", "resultado"]])
+st.caption(
+    "A receita aqui já soma o que veio da planilha migrada com o que foi "
+    "registrado no sistema. Despesas e resultado de meses anteriores ao uso "
+    "do sistema ficam incompletos, porque a planilha antiga não tinha esse "
+    "controle."
+)
 
 # ------------------------------------------------------------
 # Exportar em Excel
@@ -243,16 +296,27 @@ compras_detalhe = run_query(
     """,
     (data_inicio, data_fim),
 )
+historico_detalhe = run_query(
+    """
+    SELECT id, origem, data_venda, cliente, descricao, codigo, valor, forma_pagamento
+    FROM venda_historica
+    WHERE data_venda BETWEEN %s AND %s
+    ORDER BY data_venda
+    """,
+    (data_inicio, data_fim),
+)
 
 resumo_df = pd.DataFrame(
     [
-        {"indicador": "Receita líquida", "valor": receita_liquida},
+        {"indicador": "Receita líquida (sistema)", "valor": receita_liquida},
         {"indicador": "Custo das peças vendidas", "valor": cpv},
         {"indicador": "Margem bruta", "valor": margem_bruta},
         {"indicador": "Margem bruta (%)", "valor": round(margem_pct, 1)},
         {"indicador": "Despesas", "valor": despesas_total},
         {"indicador": "Resultado líquido", "valor": resultado_liquido},
         {"indicador": "Descontos concedidos", "valor": float(receita_resumo["descontos"])},
+        {"indicador": "Receita histórica (planilha migrada)", "valor": receita_historica},
+        {"indicador": "Receita total do período", "valor": receita_total_periodo},
     ]
 )
 
@@ -267,6 +331,7 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
     pd.DataFrame(despesas_detalhe or []).to_excel(writer, sheet_name="Despesas", index=False)
     pd.DataFrame(compras_detalhe or []).to_excel(writer, sheet_name="Compras", index=False)
+    pd.DataFrame(historico_detalhe or []).to_excel(writer, sheet_name="Histórico", index=False)
 buffer.seek(0)
 
 st.download_button(
