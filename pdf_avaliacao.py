@@ -10,6 +10,17 @@ ROSA = colors.HexColor("#D6577A")
 ROSA_CLARO = colors.HexColor("#FBE4E6")
 
 
+def _numero_valido(v):
+    """True se v for um número real utilizável (exclui None e NaN)."""
+    if v is None:
+        return False
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return False
+    return v == v  # NaN nunca é igual a si mesmo
+
+
 def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens):
     """Gera o PDF da proposta de compra pra uma fornecedora.
 
@@ -43,11 +54,12 @@ def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens):
     linhas = [cabecalho]
     total = 0.0
     for item in itens:
-        aprovada = item.get("aprovada")
+        aprovada = bool(item.get("aprovada"))
         valor = item.get("valor_proposto")
+        valor_ok = aprovada and _numero_valido(valor)
         status_txt = "Aprovada" if aprovada else "Reprovada"
-        valor_txt = f"R$ {float(valor):.2f}" if aprovada and valor is not None else "—"
-        if aprovada and valor is not None:
+        valor_txt = f"R$ {float(valor):.2f}" if valor_ok else "—"
+        if valor_ok:
             total += float(valor)
         linhas.append(
             [

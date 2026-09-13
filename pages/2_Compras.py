@@ -29,6 +29,56 @@ if not tipos_peca:
 nomes_tipo_peca = [t["nome"] for t in tipos_peca]
 tipo_peca_por_nome = {t["nome"]: t["id"] for t in tipos_peca}
 
+def _limpar_itens_avaliacao(df, tipo_padrao):
+    """Corrige células que o data_editor deixa em branco (NaN) em linhas
+    novas — sem isso, bool(NaN) vira True e derruba a lógica de aprovação."""
+    limpo = df[df["descricao"].fillna("").str.strip() != ""].copy()
+    limpo["aprovada"] = limpo["aprovada"].fillna(False).astype(bool)
+    limpo["valor"] = pd.to_numeric(limpo["valor"], errors="coerce").fillna(0.0)
+    limpo["tipo_peca"] = limpo["tipo_peca"].fillna(tipo_padrao)
+    limpo["tamanho"] = limpo["tamanho"].fillna("")
+    limpo["observacao"] = limpo["observacao"].fillna("")
+    return limpo
+
+
+def _salvar_itens_avaliacao(avaliacao_id, itens_df, tipo_peca_por_nome):
+    """Apaga os itens atuais da avaliação e grava os do dataframe editado.
+    Retorna a lista pronta pra gerar o PDF."""
+    run_query("DELETE FROM avaliacao_item WHERE avaliacao_id = %s", (avaliacao_id,), fetch=False)
+    itens_para_pdf = []
+    for _, item in itens_df.iterrows():
+        aprovada = bool(item["aprovada"])
+        valor_proposto = float(item["valor"]) if aprovada else None
+        run_query(
+            """
+            INSERT INTO avaliacao_item
+                (avaliacao_id, descricao, tipo_peca_id, tamanho, aprovada, valor_proposto, observacao)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                avaliacao_id,
+                item["descricao"],
+                tipo_peca_por_nome.get(item["tipo_peca"]),
+                item["tamanho"] or None,
+                aprovada,
+                valor_proposto,
+                item["observacao"] or None,
+            ),
+            fetch=False,
+        )
+        itens_para_pdf.append(
+            {
+                "descricao": item["descricao"],
+                "tipo_peca": item["tipo_peca"],
+                "tamanho": item["tamanho"],
+                "aprovada": aprovada,
+                "valor_proposto": valor_proposto,
+                "observacao": item["observacao"],
+            }
+        )
+    return itens_para_pdf
+
+
 aba_compra, aba_avaliacao = st.tabs(["Registrar Compra", "Avaliação de Peças"])
 
 # ================================================================
@@ -276,96 +326,174 @@ with aba_avaliacao:
         "ou reprove cada peça, e gere o PDF da proposta pra enviar a ela."
     )
 
+    if "editando_avaliacao_id" not in st.session_state:
+        st.session_state.editando_avaliacao_id = None
+
     fornecedoras_aval = run_query("SELECT id, nome FROM fornecedora ORDER BY nome")
     if not fornecedoras_aval:
         st.warning("Cadastre uma fornecedora antes de criar uma avaliação.")
     else:
         opcoes_fornecedora_aval = {f["nome"]: f["id"] for f in fornecedoras_aval}
-        nome_fornecedora_aval = st.selectbox(
-            "Fornecedora", options=list(opcoes_fornecedora_aval.keys()), key="fornecedora_aval_sel"
-        )
-        data_avaliacao = st.date_input("Data da avaliação", value=date.today(), key="data_aval")
 
-        if "avaliacao_version" not in st.session_state:
-            st.session_state.avaliacao_version = 0
+        # ---------------------------------------------------------
+        # Modo edição — só pra avaliações ainda pendentes
+        # ---------------------------------------------------------
+        if st.session_state.editando_avaliacao_id:
+            aval_id_edicao = st.session_state.editando_avaliacao_id
+            aval_atual = run_query(
+                """
+                SELECT a.id, a.fornecedora_id, f.nome AS fornecedora, a.data_avaliacao, a.status
+                FROM avaliacao a JOIN fornecedora f ON f.id = a.fornecedora_id
+                WHERE a.id = %s
+                """,
+                (aval_id_edicao,),
+            )
+            if not aval_atual or aval_atual[0]["status"] != "pendente":
+                st.warning("Essa avaliação não está mais pendente — não dá mais pra editar.")
+                st.session_state.editando_avaliacao_id = None
+                st.rerun()
+            aval_atual = aval_atual[0]
 
-        itens_avaliacao = st.data_editor(
-            pd.DataFrame(
+            st.subheader(f"Editando avaliação #{aval_id_edicao}")
+
+            nomes_fornecedora_lista = list(opcoes_fornecedora_aval.keys())
+            indice_fornecedora = (
+                nomes_fornecedora_lista.index(aval_atual["fornecedora"])
+                if aval_atual["fornecedora"] in nomes_fornecedora_lista
+                else 0
+            )
+            nome_fornecedora_edicao = st.selectbox(
+                "Fornecedora", options=nomes_fornecedora_lista, index=indice_fornecedora, key="fornecedora_edicao"
+            )
+            data_avaliacao_edicao = st.date_input(
+                "Data da avaliação", value=aval_atual["data_avaliacao"], key="data_edicao"
+            )
+
+            itens_atuais = run_query(
+                """
+                SELECT ai.descricao, COALESCE(tp.nome, %s) AS tipo_peca, ai.tamanho,
+                       ai.aprovada, ai.valor_proposto, ai.observacao
+                FROM avaliacao_item ai
+                LEFT JOIN tipo_peca tp ON tp.id = ai.tipo_peca_id
+                WHERE ai.avaliacao_id = %s
+                ORDER BY ai.id
+                """,
+                (nomes_tipo_peca[0], aval_id_edicao),
+            )
+            df_edicao = pd.DataFrame(
                 [
                     {
-                        "descricao": "",
-                        "tipo_peca": nomes_tipo_peca[0],
-                        "tamanho": "",
-                        "aprovada": False,
-                        "valor": 0.0,
-                        "observacao": "",
+                        "descricao": i["descricao"],
+                        "tipo_peca": i["tipo_peca"],
+                        "tamanho": i["tamanho"] or "",
+                        "aprovada": i["aprovada"],
+                        "valor": float(i["valor_proposto"]) if i["valor_proposto"] is not None else 0.0,
+                        "observacao": i["observacao"] or "",
                     }
+                    for i in itens_atuais
                 ]
-            ),
-            num_rows="dynamic",
-            use_container_width=True,
-            key=f"editor_avaliacao_{st.session_state.avaliacao_version}",
-            column_config={
-                "tipo_peca": st.column_config.SelectboxColumn("Tipo de peça", options=nomes_tipo_peca),
-                "aprovada": st.column_config.CheckboxColumn("Aprovada?"),
-                "valor": st.column_config.NumberColumn(
-                    "Valor proposto (R$)", min_value=0.0, step=1.0, help="Só vale se a peça for aprovada"
-                ),
-            },
-        )
-
-        itens_aval_validos = itens_avaliacao[itens_avaliacao["descricao"].str.strip() != ""]
-
-        if st.button("Salvar avaliação", type="primary", disabled=itens_aval_validos.empty):
-            fornecedora_aval_id = opcoes_fornecedora_aval[nome_fornecedora_aval]
-
-            avaliacao = run_query(
-                "INSERT INTO avaliacao (fornecedora_id, data_avaliacao) VALUES (%s, %s) RETURNING id",
-                (fornecedora_aval_id, data_avaliacao),
             )
-            avaliacao_id = avaliacao[0]["id"]
 
-            itens_para_pdf = []
-            for _, item in itens_aval_validos.iterrows():
-                aprovada = bool(item["aprovada"])
-                valor_proposto = float(item["valor"]) if aprovada else None
-                run_query(
-                    """
-                    INSERT INTO avaliacao_item
-                        (avaliacao_id, descricao, tipo_peca_id, tamanho, aprovada, valor_proposto, observacao)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        avaliacao_id,
-                        item["descricao"],
-                        tipo_peca_por_nome.get(item["tipo_peca"]),
-                        item["tamanho"] or None,
-                        aprovada,
-                        valor_proposto,
-                        item["observacao"] or None,
+            itens_editados = st.data_editor(
+                df_edicao,
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"editor_edicao_{aval_id_edicao}",
+                column_config={
+                    "tipo_peca": st.column_config.SelectboxColumn("Tipo de peça", options=nomes_tipo_peca),
+                    "aprovada": st.column_config.CheckboxColumn("Aprovada?"),
+                    "valor": st.column_config.NumberColumn(
+                        "Valor proposto (R$)", min_value=0.0, step=1.0, help="Só vale se a peça for aprovada"
                     ),
+                },
+            )
+            itens_editados_limpos = _limpar_itens_avaliacao(itens_editados, nomes_tipo_peca[0])
+
+            col_salvar, col_cancelar = st.columns(2)
+            if col_salvar.button("Salvar alterações", type="primary", disabled=itens_editados_limpos.empty):
+                run_query(
+                    "UPDATE avaliacao SET fornecedora_id = %s, data_avaliacao = %s WHERE id = %s",
+                    (opcoes_fornecedora_aval[nome_fornecedora_edicao], data_avaliacao_edicao, aval_id_edicao),
                     fetch=False,
                 )
-                itens_para_pdf.append(
-                    {
-                        "descricao": item["descricao"],
-                        "tipo_peca": item["tipo_peca"],
-                        "tamanho": item["tamanho"],
-                        "aprovada": aprovada,
-                        "valor_proposto": valor_proposto,
-                        "observacao": item["observacao"],
-                    }
+                itens_para_pdf = _salvar_itens_avaliacao(
+                    aval_id_edicao, itens_editados_limpos, tipo_peca_por_nome
                 )
+                st.success(f"Avaliação #{aval_id_edicao} atualizada.")
+                pdf_bytes = gerar_pdf_avaliacao(nome_fornecedora_edicao, data_avaliacao_edicao, itens_para_pdf)
+                st.download_button(
+                    "Baixar PDF atualizado",
+                    data=pdf_bytes,
+                    file_name=f"proposta_avaliacao_{aval_id_edicao}.pdf",
+                    mime="application/pdf",
+                    key=f"pdf_pos_edicao_{aval_id_edicao}",
+                )
+                if st.button("Concluir edição"):
+                    st.session_state.editando_avaliacao_id = None
+                    st.rerun()
+            if col_cancelar.button("Cancelar edição"):
+                st.session_state.editando_avaliacao_id = None
+                st.rerun()
 
-            st.success(f"Avaliação #{avaliacao_id} salva com {len(itens_aval_validos)} peça(s).")
-
-            pdf_bytes = gerar_pdf_avaliacao(nome_fornecedora_aval, data_avaliacao, itens_para_pdf)
-            st.download_button(
-                "Baixar PDF da proposta",
-                data=pdf_bytes,
-                file_name=f"proposta_avaliacao_{avaliacao_id}.pdf",
-                mime="application/pdf",
+        # ---------------------------------------------------------
+        # Modo criação — só aparece quando não está editando
+        # ---------------------------------------------------------
+        else:
+            nome_fornecedora_aval = st.selectbox(
+                "Fornecedora", options=list(opcoes_fornecedora_aval.keys()), key="fornecedora_aval_sel"
             )
+            data_avaliacao = st.date_input("Data da avaliação", value=date.today(), key="data_aval")
+
+            if "avaliacao_version" not in st.session_state:
+                st.session_state.avaliacao_version = 0
+
+            itens_avaliacao = st.data_editor(
+                pd.DataFrame(
+                    [
+                        {
+                            "descricao": "",
+                            "tipo_peca": nomes_tipo_peca[0],
+                            "tamanho": "",
+                            "aprovada": False,
+                            "valor": 0.0,
+                            "observacao": "",
+                        }
+                    ]
+                ),
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"editor_avaliacao_{st.session_state.avaliacao_version}",
+                column_config={
+                    "tipo_peca": st.column_config.SelectboxColumn("Tipo de peça", options=nomes_tipo_peca),
+                    "aprovada": st.column_config.CheckboxColumn("Aprovada?"),
+                    "valor": st.column_config.NumberColumn(
+                        "Valor proposto (R$)", min_value=0.0, step=1.0, help="Só vale se a peça for aprovada"
+                    ),
+                },
+            )
+
+            itens_aval_validos = _limpar_itens_avaliacao(itens_avaliacao, nomes_tipo_peca[0])
+
+            if st.button("Salvar avaliação", type="primary", disabled=itens_aval_validos.empty):
+                fornecedora_aval_id = opcoes_fornecedora_aval[nome_fornecedora_aval]
+
+                avaliacao = run_query(
+                    "INSERT INTO avaliacao (fornecedora_id, data_avaliacao) VALUES (%s, %s) RETURNING id",
+                    (fornecedora_aval_id, data_avaliacao),
+                )
+                avaliacao_id = avaliacao[0]["id"]
+
+                itens_para_pdf = _salvar_itens_avaliacao(avaliacao_id, itens_aval_validos, tipo_peca_por_nome)
+
+                st.success(f"Avaliação #{avaliacao_id} salva com {len(itens_aval_validos)} peça(s).")
+
+                pdf_bytes = gerar_pdf_avaliacao(nome_fornecedora_aval, data_avaliacao, itens_para_pdf)
+                st.download_button(
+                    "Baixar PDF da proposta",
+                    data=pdf_bytes,
+                    file_name=f"proposta_avaliacao_{avaliacao_id}.pdf",
+                    mime="application/pdf",
+                )
 
         st.divider()
         st.subheader("Avaliações recentes")
@@ -395,7 +523,7 @@ with aba_avaliacao:
             escolha_aval = st.selectbox("Selecionar avaliação", options=list(opcoes_aval.keys()))
             aval_selecionada = opcoes_aval[escolha_aval]
 
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 itens_aval_download = run_query(
                     """
@@ -419,6 +547,11 @@ with aba_avaliacao:
                     key=f"pdf_{aval_selecionada['id']}",
                 )
             with col2:
+                if aval_selecionada["status"] == "pendente":
+                    if st.button("Editar", key=f"editar_{aval_selecionada['id']}"):
+                        st.session_state.editando_avaliacao_id = aval_selecionada["id"]
+                        st.rerun()
+            with col3:
                 if aval_selecionada["status"] == "pendente":
                     if st.button("Marcar como recusada", key=f"recusar_{aval_selecionada['id']}"):
                         run_query(
