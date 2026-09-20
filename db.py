@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import streamlit as st
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -34,6 +36,37 @@ def run_query(sql, params=None, fetch=True):
             rows = cur.fetchall() if fetch else None
         conn.commit()
         return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def transacao():
+    """Abre UMA conexão e roda vários comandos na mesma transação: ou tudo é
+    gravado, ou (se der erro no meio) nada é.
+
+    Uso:
+        with transacao() as executar:
+            linhas = executar("INSERT ... RETURNING id", (a, b), fetch=True)
+            executar("UPDATE ...", (c,))
+
+    Serve também pra ler várias consultas numa conexão só (mais rápido que
+    abrir uma conexão por consulta).
+    """
+    conn = psycopg2.connect(st.secrets["DATABASE_URL"])
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+            def executar(sql, params=None, fetch=False):
+                params = tuple(_sanitize(p) for p in params) if params else params
+                cur.execute(sql, params or ())
+                return cur.fetchall() if fetch else None
+
+            yield executar
+        conn.commit()
     except Exception:
         conn.rollback()
         raise

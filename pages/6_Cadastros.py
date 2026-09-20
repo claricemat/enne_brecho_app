@@ -11,8 +11,8 @@ botao_logout()
 st.title("Cadastros")
 st.caption("Catálogos usados nas outras telas do sistema.")
 
-aba_peca, aba_compra, aba_contas = st.tabs(
-    ["Tipos de peça", "Tipos de compra", "Plano de contas"]
+aba_peca, aba_compra, aba_contas, aba_contas_fin = st.tabs(
+    ["Tipos de peça", "Tipos de compra", "Plano de contas", "Contas e caixa"]
 )
 
 # ------------------------------------------------------------
@@ -143,6 +143,60 @@ with aba_contas:
                 st.error(
                     "Não foi possível excluir — provavelmente já existe despesa ou venda "
                     f"usando essa conta. Erro original: {e}"
+                )
+    else:
+        st.info("Nenhuma conta cadastrada ainda.")
+
+# ------------------------------------------------------------
+# Contas bancárias e caixa (usadas nos pagamentos de compras)
+# ------------------------------------------------------------
+with aba_contas_fin:
+    st.caption(
+        "Contas bancárias e caixa de onde sai o dinheiro dos pagamentos. "
+        "Use um nome que identifique a conta e de quem é (ex: Nubank Ana, Itaú Clarice)."
+    )
+    with st.form("nova_conta_financeira", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        nome = col1.text_input("Nome da conta")
+        tipo_rotulo = col2.selectbox("Tipo", ["Conta bancária", "Caixa"])
+        if st.form_submit_button("Adicionar"):
+            if not nome.strip():
+                st.error("Informe um nome.")
+            else:
+                try:
+                    run_query(
+                        "INSERT INTO conta_financeira (nome, tipo) VALUES (%s, %s)",
+                        (nome.strip(), "banco" if tipo_rotulo == "Conta bancária" else "caixa"),
+                        fetch=False,
+                    )
+                    st.success(f"'{nome}' adicionada.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Não foi possível adicionar (talvez já exista). Erro: {e}")
+
+    contas_fin = run_query(
+        """
+        SELECT id, nome,
+               CASE tipo WHEN 'banco' THEN 'Conta bancária' ELSE 'Caixa' END AS tipo_conta
+        FROM conta_financeira
+        ORDER BY conta_financeira.tipo, nome
+        """
+    )
+    if contas_fin:
+        st.dataframe(contas_fin, use_container_width=True, hide_index=True)
+        opcoes = {c["nome"]: c["id"] for c in contas_fin}
+        escolha = st.selectbox("Excluir", options=list(opcoes.keys()), key="excluir_conta_fin")
+        if st.button("Excluir conta", type="secondary"):
+            try:
+                run_query(
+                    "DELETE FROM conta_financeira WHERE id = %s", (opcoes[escolha],), fetch=False
+                )
+                st.success("Excluída.")
+                st.rerun()
+            except Exception as e:
+                st.error(
+                    "Não foi possível excluir — provavelmente já existe pagamento "
+                    f"registrado com essa conta. Erro original: {e}"
                 )
     else:
         st.info("Nenhuma conta cadastrada ainda.")

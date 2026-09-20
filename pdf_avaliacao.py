@@ -1,10 +1,14 @@
 from io import BytesIO
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from formatacao import brl, fmt_data
+from prazos_proposta import PRAZO_CURTO_DIAS, PRAZO_LONGO_DIAS_UTEIS
 
 ROSA = colors.HexColor("#D6577A")
 ROSA_CLARO = colors.HexColor("#FBE4E6")
@@ -21,11 +25,12 @@ def _numero_valido(v):
     return v == v  # NaN nunca é igual a si mesmo
 
 
-def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens):
-    """Gera o PDF da proposta de compra pra uma fornecedora.
+def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens, proposta_aceita=None):
+    """Gera o PDF com as DUAS propostas de compra pra uma fornecedora.
 
     itens: lista de dicts com descricao, tipo_peca, tamanho, aprovada,
-    valor_proposto, observacao.
+    valor_curto_prazo, valor_longo_prazo, observacao.
+    proposta_aceita: None, 'curto' ou 'longo' (se já foi fechada, aparece no PDF).
     Retorna os bytes do PDF, prontos pro st.download_button.
     """
     buffer = BytesIO()
@@ -41,58 +46,120 @@ def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens):
     titulo_estilo = estilos["Heading1"]
     titulo_estilo.textColor = ROSA
     normal = estilos["Normal"]
+    celula = ParagraphStyle("celula", parent=normal, fontSize=8, leading=10)
+    celula_cabecalho = ParagraphStyle(
+        "celula_cabecalho", parent=celula, textColor=colors.white, fontName="Helvetica-Bold"
+    )
+
+    def p(texto, estilo=celula):
+        return Paragraph(escape(str(texto or "")), estilo)
 
     elementos = [
-        Paragraph("ENNE Brechó — Proposta de compra", titulo_estilo),
+        Paragraph("ENNE Brechó — Propostas de compra", titulo_estilo),
         Spacer(1, 6),
-        Paragraph(f"<b>Fornecedora:</b> {fornecedora_nome}", normal),
-        Paragraph(f"<b>Data da avaliação:</b> {data_avaliacao}", normal),
-        Spacer(1, 14),
+        Paragraph(f"<b>Fornecedora:</b> {escape(str(fornecedora_nome))}", normal),
+        Paragraph(f"<b>Data da avaliação:</b> {fmt_data(data_avaliacao)}", normal),
+        Spacer(1, 8),
+        Paragraph(
+            "Para as peças aprovadas abaixo, apresentamos duas propostas. "
+            "<b>Apenas uma delas será fechada</b>, conforme a sua escolha.",
+            normal,
+        ),
+        Spacer(1, 12),
     ]
 
-    cabecalho = ["Descrição", "Tipo", "Tamanho", "Status", "Valor", "Observação"]
+    cabecalho = [
+        p("Descrição", celula_cabecalho),
+        p("Tipo", celula_cabecalho),
+        p("Tam.", celula_cabecalho),
+        p("Status", celula_cabecalho),
+        Paragraph(f"Proposta A<br/>(até {PRAZO_CURTO_DIAS} dias)", celula_cabecalho),
+        Paragraph(f"Proposta B<br/>(até {PRAZO_LONGO_DIAS_UTEIS} dias úteis)", celula_cabecalho),
+        p("Observação", celula_cabecalho),
+    ]
     linhas = [cabecalho]
-    total = 0.0
+    total_curto = 0.0
+    total_longo = 0.0
     for item in itens:
         aprovada = bool(item.get("aprovada"))
-        valor = item.get("valor_proposto")
-        valor_ok = aprovada and _numero_valido(valor)
-        status_txt = "Aprovada" if aprovada else "Reprovada"
-        valor_txt = f"R$ {float(valor):.2f}" if valor_ok else "—"
-        if valor_ok:
-            total += float(valor)
+        curto = item.get("valor_curto_prazo")
+        longo = item.get("valor_longo_prazo")
+        curto_ok = aprovada and _numero_valido(curto)
+        longo_ok = aprovada and _numero_valido(longo)
+        if curto_ok:
+            total_curto += float(curto)
+        if longo_ok:
+            total_longo += float(longo)
         linhas.append(
             [
-                item.get("descricao") or "",
-                item.get("tipo_peca") or "",
-                item.get("tamanho") or "",
-                status_txt,
-                valor_txt,
-                item.get("observacao") or "",
+                p(item.get("descricao")),
+                p(item.get("tipo_peca")),
+                p(item.get("tamanho")),
+                p("Aprovada" if aprovada else "Reprovada"),
+                p(brl(curto) if curto_ok else "—"),
+                p(brl(longo) if longo_ok else "—"),
+                p(item.get("observacao")),
             ]
         )
 
-    tabela = Table(linhas, colWidths=[4.2 * cm, 2.6 * cm, 1.8 * cm, 2.2 * cm, 2.2 * cm, 4 * cm], repeatRows=1)
+    tabela = Table(
+        linhas,
+        colWidths=[3.8 * cm, 2.3 * cm, 1.3 * cm, 1.9 * cm, 2.4 * cm, 2.7 * cm, 3.0 * cm],
+        repeatRows=1,
+    )
     tabela.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), ROSA),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ROSA_CLARO]),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                 ("TOPPADDING", (0, 0), (-1, -1), 4),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]
         )
     )
     elementos.append(tabela)
-    elementos.append(Spacer(1, 14))
-    elementos.append(Paragraph(f"<b>Total proposto (peças aprovadas):</b> R$ {total:.2f}", normal))
+    elementos.append(Spacer(1, 16))
+
+    # ---- resumo das duas propostas ----
+    resumo = Table(
+        [
+            [
+                Paragraph(f"<b>Proposta A</b> — pagamento em até {PRAZO_CURTO_DIAS} dias", normal),
+                Paragraph(f"<b>Total: {brl(total_curto)}</b>", normal),
+            ],
+            [
+                Paragraph(f"<b>Proposta B</b> — pagamento em até {PRAZO_LONGO_DIAS_UTEIS} dias úteis", normal),
+                Paragraph(f"<b>Total: {brl(total_longo)}</b>", normal),
+            ],
+        ],
+        colWidths=[11.5 * cm, 5.9 * cm],
+    )
+    resumo.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.8, ROSA),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.5, ROSA),
+                ("BACKGROUND", (0, 0), (-1, -1), ROSA_CLARO),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elementos.append(resumo)
+    elementos.append(Spacer(1, 16))
+
+    if proposta_aceita in ("curto", "longo"):
+        nome = "A (curto prazo)" if proposta_aceita == "curto" else "B (longo prazo)"
+        elementos.append(Paragraph(f"<b>Proposta aceita:</b> {nome}", normal))
+    else:
+        elementos.append(
+            Paragraph("<b>Proposta escolhida pela fornecedora:</b> (&nbsp;&nbsp;&nbsp;) A &nbsp;&nbsp;&nbsp; (&nbsp;&nbsp;&nbsp;) B", normal)
+        )
 
     doc.build(elementos)
     buffer.seek(0)
