@@ -47,8 +47,16 @@ def _limpar_itens_avaliacao(df, tipo_padrao):
     limpo["valor_longo"] = pd.to_numeric(limpo["valor_longo"], errors="coerce").fillna(0.0)
     limpo["tipo_peca"] = limpo["tipo_peca"].fillna(tipo_padrao)
     limpo["tamanho"] = limpo["tamanho"].fillna("")
+    limpo["marca"] = limpo["marca"].fillna("")
     limpo["observacao"] = limpo["observacao"].fillna("")
     return limpo
+
+
+def _marca_limpa(valor):
+    """Marca digitada (texto livre): tira espaços sobrando; vazio/NaN vira None."""
+    if valor is None or (isinstance(valor, float) and valor != valor):
+        return None
+    return " ".join(str(valor).split()) or None
 
 
 def _aprovadas_sem_valor(itens_df):
@@ -69,13 +77,14 @@ def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome
         executar(
             """
             INSERT INTO avaliacao_item
-                (avaliacao_id, descricao, tipo_peca_id, tamanho, aprovada,
+                (avaliacao_id, descricao, marca, tipo_peca_id, tamanho, aprovada,
                  valor_curto_prazo, valor_longo_prazo, observacao)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 avaliacao_id,
                 item["descricao"],
+                _marca_limpa(item["marca"]),
                 tipo_peca_por_nome.get(item["tipo_peca"]),
                 item["tamanho"] or None,
                 aprovada,
@@ -87,6 +96,7 @@ def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome
         itens_para_pdf.append(
             {
                 "descricao": item["descricao"],
+                "marca": _marca_limpa(item["marca"]),
                 "tipo_peca": item["tipo_peca"],
                 "tamanho": item["tamanho"],
                 "aprovada": aprovada,
@@ -101,6 +111,7 @@ def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome
 def _config_colunas_avaliacao():
     return {
         "descricao": st.column_config.TextColumn("Descrição"),
+        "marca": st.column_config.TextColumn("Marca"),
         "tipo_peca": st.column_config.SelectboxColumn("Tipo de peça", options=nomes_tipo_peca),
         "tamanho": st.column_config.TextColumn("Tamanho"),
         "aprovada": st.column_config.CheckboxColumn("Aprovada?"),
@@ -151,7 +162,16 @@ with aba_compra:
     avaliacao_selecionada_id = None
     proposta_escolhida = None  # 'curto' ou 'longo' (só quando usa uma avaliação)
     itens_iniciais = pd.DataFrame(
-        [{"descricao": "", "tipo_peca": nomes_tipo_peca[0], "tamanho": "", "preco_venda": 0.0, "preco_custo": 0.0}]
+        [
+            {
+                "descricao": "",
+                "marca": "",
+                "tipo_peca": nomes_tipo_peca[0],
+                "tamanho": "",
+                "preco_venda": 0.0,
+                "preco_custo": 0.0,
+            }
+        ]
     )
 
     if fornecedora_id:
@@ -196,7 +216,7 @@ with aba_compra:
 
                 itens_aprovados = run_query(
                     """
-                    SELECT ai.descricao, COALESCE(tp.nome, %s) AS tipo_peca, ai.tamanho,
+                    SELECT ai.descricao, ai.marca, COALESCE(tp.nome, %s) AS tipo_peca, ai.tamanho,
                            ai.valor_curto_prazo, ai.valor_longo_prazo
                     FROM avaliacao_item ai
                     LEFT JOIN tipo_peca tp ON tp.id = ai.tipo_peca_id
@@ -210,6 +230,7 @@ with aba_compra:
                     [
                         {
                             "descricao": i["descricao"],
+                            "marca": i["marca"] or "",
                             "tipo_peca": i["tipo_peca"],
                             "tamanho": i["tamanho"] or "",
                             "preco_venda": 0.0,
@@ -262,6 +283,7 @@ with aba_compra:
         use_container_width=True,
         key=f"editor_compra_{versao_compra}_{avaliacao_selecionada_id or 'manual'}_{proposta_escolhida or ''}",
         column_config={
+            "marca": st.column_config.TextColumn("Marca"),
             "tipo_peca": st.column_config.SelectboxColumn("Tipo de peça", options=nomes_tipo_peca),
             "preco_venda": st.column_config.NumberColumn("Preço de venda (R$)", min_value=0.0, step=1.0),
             "preco_custo": st.column_config.NumberColumn("Custo pago (R$)", min_value=0.0, step=1.0),
@@ -315,13 +337,14 @@ with aba_compra:
                 for _, item in itens_validos.iterrows():
                     produto = executar(
                         """
-                        INSERT INTO produto (compra_id, descricao, tipo_peca_id, tamanho, preco_custo, preco_venda)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO produto (compra_id, descricao, marca, tipo_peca_id, tamanho, preco_custo, preco_venda)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                         """,
                         (
                             compra_id,
                             item["descricao"],
+                            _marca_limpa(item["marca"]),
                             tipo_peca_por_nome.get(item["tipo_peca"]),
                             item["tamanho"] or None,
                             item["preco_custo"],
@@ -493,7 +516,7 @@ with aba_avaliacao:
 
             itens_atuais = run_query(
                 """
-                SELECT ai.descricao, COALESCE(tp.nome, %s) AS tipo_peca, ai.tamanho,
+                SELECT ai.descricao, ai.marca, COALESCE(tp.nome, %s) AS tipo_peca, ai.tamanho,
                        ai.aprovada, ai.valor_curto_prazo, ai.valor_longo_prazo, ai.observacao
                 FROM avaliacao_item ai
                 LEFT JOIN tipo_peca tp ON tp.id = ai.tipo_peca_id
@@ -506,6 +529,7 @@ with aba_avaliacao:
                 [
                     {
                         "descricao": i["descricao"],
+                        "marca": i["marca"] or "",
                         "tipo_peca": i["tipo_peca"],
                         "tamanho": i["tamanho"] or "",
                         "aprovada": i["aprovada"],
@@ -579,6 +603,7 @@ with aba_avaliacao:
                     [
                         {
                             "descricao": "",
+                            "marca": "",
                             "tipo_peca": nomes_tipo_peca[0],
                             "tamanho": "",
                             "aprovada": False,
@@ -666,7 +691,7 @@ with aba_avaliacao:
             with col1:
                 itens_aval_download = run_query(
                     """
-                    SELECT ai.descricao, tp.nome AS tipo_peca, ai.tamanho, ai.aprovada,
+                    SELECT ai.descricao, ai.marca, tp.nome AS tipo_peca, ai.tamanho, ai.aprovada,
                            ai.valor_curto_prazo, ai.valor_longo_prazo, ai.observacao
                     FROM avaliacao_item ai
                     LEFT JOIN tipo_peca tp ON tp.id = ai.tipo_peca_id

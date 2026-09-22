@@ -29,7 +29,7 @@ def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens, proposta_aceita
     """Gera o PDF com as DUAS propostas de compra pra uma fornecedora.
 
     itens: lista de dicts com descricao, tipo_peca, tamanho, aprovada,
-    valor_curto_prazo, valor_longo_prazo, observacao.
+    valor_curto_prazo, valor_longo_prazo, observacao (e, opcional, marca).
     proposta_aceita: None, 'curto' ou 'longo' (se já foi fechada, aparece no PDF).
     Retorna os bytes do PDF, prontos pro st.download_button.
     """
@@ -70,6 +70,7 @@ def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens, proposta_aceita
 
     cabecalho = [
         p("Descrição", celula_cabecalho),
+        p("Marca", celula_cabecalho),
         p("Tipo", celula_cabecalho),
         p("Tam.", celula_cabecalho),
         p("Status", celula_cabecalho),
@@ -93,6 +94,7 @@ def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens, proposta_aceita
         linhas.append(
             [
                 p(item.get("descricao")),
+                p(item.get("marca")),
                 p(item.get("tipo_peca")),
                 p(item.get("tamanho")),
                 p("Aprovada" if aprovada else "Reprovada"),
@@ -104,7 +106,7 @@ def gerar_pdf_avaliacao(fornecedora_nome, data_avaliacao, itens, proposta_aceita
 
     tabela = Table(
         linhas,
-        colWidths=[3.8 * cm, 2.3 * cm, 1.3 * cm, 1.9 * cm, 2.4 * cm, 2.7 * cm, 3.0 * cm],
+        colWidths=[3.2 * cm, 2.2 * cm, 2.0 * cm, 1.2 * cm, 1.8 * cm, 2.3 * cm, 2.5 * cm, 2.2 * cm],
         repeatRows=1,
     )
     tabela.setStyle(

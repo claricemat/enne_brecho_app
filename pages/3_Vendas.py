@@ -1,3 +1,5 @@
+import re
+
 import pandas as pd
 import streamlit as st
 
@@ -16,7 +18,7 @@ if "venda_version" not in st.session_state:
 
 produtos = run_query(
     """
-    SELECT p.id, p.descricao, tp.nome AS tipo_peca, p.tamanho, p.preco_venda
+    SELECT p.id, p.descricao, p.marca, tp.nome AS tipo_peca, p.tamanho, p.preco_venda
     FROM produto p
     LEFT JOIN tipo_peca tp ON tp.id = p.tipo_peca_id
     WHERE p.status = 'em_estoque'
@@ -32,11 +34,22 @@ df_estoque = pd.DataFrame(produtos)
 df_estoque.insert(0, "vender", False)
 df_estoque["preco_vendido"] = df_estoque["preco_venda"]
 
-busca = st.text_input("Buscar peça (por descrição)", placeholder="ex: camisa azul")
+busca = st.text_input(
+    "Buscar peça (por código/ID, descrição ou marca)",
+    placeholder="ex: 42, camisa azul, Farm",
+    help="O código é o número que está na etiqueta. Dá para digitar vários de uma vez: 12, 15, 20.",
+)
 if busca:
-    df_estoque = df_estoque[
-        df_estoque["descricao"].str.contains(busca, case=False, na=False)
-    ].reset_index(drop=True)
+    termo = busca.strip()
+    mascara = (
+        df_estoque["descricao"].str.contains(termo, case=False, na=False, regex=False)
+        | df_estoque["marca"].str.contains(termo, case=False, na=False, regex=False)
+    )
+    # números (com ou sem #, separados por vírgula/espaço) filtram pelo código da peça
+    codigos = [t.lstrip("#") for t in re.split(r"[\s,;]+", termo) if t]
+    if codigos and all(c.isdigit() for c in codigos):
+        mascara |= df_estoque["id"].isin({int(c) for c in codigos})
+    df_estoque = df_estoque[mascara].reset_index(drop=True)
 
 st.caption(
     "Marque as peças vendidas nessa transação. O preço vem pré-preenchido com o "
@@ -51,10 +64,11 @@ editado = st.data_editor(
     df_estoque,
     use_container_width=True,
     hide_index=True,
-    disabled=["id", "descricao", "tipo_peca", "tamanho", "preco_venda"],
+    disabled=["id", "descricao", "marca", "tipo_peca", "tamanho", "preco_venda"],
     key=f"editor_venda_{st.session_state.venda_version}_{busca}",
     column_config={
         "vender": st.column_config.CheckboxColumn("Vender?"),
+        "marca": st.column_config.TextColumn("Marca"),
         "preco_vendido": st.column_config.NumberColumn(
             "Preço vendido (R$)", min_value=0.0, step=1.0
         ),
