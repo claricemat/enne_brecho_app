@@ -9,6 +9,13 @@ from auth import exigir_login, botao_logout
 from pdf_avaliacao import gerar_pdf_avaliacao
 from controle_pagamentos import renderizar_controle_pagamentos
 from formatacao import brl, fmt_data
+from parcelas import dec, editor_parcelas
+from compras_parcelas import (
+    ParcelasAlteradasError,
+    compras_em_aberto,
+    parcelas_da_compra,
+    reparcelar,
+)
 from prazos_proposta import (
     PRAZO_CURTO_DIAS,
     PRAZO_LONGO_DIAS_UTEIS,
@@ -244,32 +251,15 @@ with aba_compra:
                     "falta só definir o preço de venda de cada uma."
                 )
 
-    if proposta_escolhida:
-        st.caption("Pagamento conforme a proposta aceita; o vencimento sugerido pode ser ajustado abaixo.")
-    elif tipo_selecionado["prazo_dias"] > 0:
-        st.caption(f"Prazo de pagamento: {tipo_selecionado['prazo_dias']} dias após o aceite.")
-    else:
-        st.caption("Compra à vista — já entra como paga na data de hoje.")
-
     data_aceite = st.date_input("Data da compra", value=date.today(), format="DD/MM/YYYY")
 
-    # ---- vencimento (sugerido pela proposta ou pelo tipo de compra; dá pra ajustar) ----
+    # vencimento sugerido pela proposta ou pelo tipo de compra (vira o 1º vencimento)
     if proposta_escolhida:
         vencimento_sugerido = vencimento_da_proposta(proposta_escolhida, data_aceite)
     elif tipo_selecionado["prazo_dias"] > 0:
         vencimento_sugerido = data_aceite + timedelta(days=tipo_selecionado["prazo_dias"])
     else:
         vencimento_sugerido = None
-
-    data_vencimento = None
-    if vencimento_sugerido:
-        data_vencimento = st.date_input(
-            "Data de vencimento",
-            value=vencimento_sugerido,
-            min_value=data_aceite,
-            format="DD/MM/YYYY",
-            key=f"venc_compra_{versao_compra}_{vencimento_sugerido}",
-        )
 
     st.subheader("Peças do lote")
     st.caption(
@@ -302,13 +292,53 @@ with aba_compra:
         valor_total = round(itens_validos["preco_custo"].sum(), 2)
         st.metric("Valor total do lote (custo)", f"R$ {valor_total:.2f}")
 
-    if st.button("Registrar compra", type="primary", disabled=itens_validos.empty):
-        if data_vencimento is not None:
+    # ---- pagamento: à vista ou a prazo/parcelado ----
+    st.subheader("Pagamento")
+    A_VISTA = "À vista (já pago na data da compra)"
+    A_PRAZO = "A prazo / parcelado"
+    parcelas_compra, erro_parcelas = [], None
+    if itens_validos.empty:
+        st.caption("Preencha as peças do lote para definir o pagamento.")
+        modo_pagamento = A_VISTA
+    elif valor_total <= 0:
+        st.caption("Lote sem custo: a compra entra como paga.")
+        modo_pagamento = A_VISTA
+    else:
+        modo_pagamento = st.radio(
+            "Como vai ser pago",
+            [A_VISTA, A_PRAZO],
+            index=1 if vencimento_sugerido else 0,
+            horizontal=True,
+            key=f"compra_modo_{versao_compra}_{tipo_selecionado['id']}_{proposta_escolhida or ''}",
+            help="Qualquer tipo de compra pode ser parcelado. As parcelas são pagas "
+                 "na aba Controle de pagamentos (peças).",
+        )
+        if modo_pagamento == A_PRAZO:
+            if proposta_escolhida:
+                st.caption("1º vencimento sugerido pela proposta aceita; dá para mudar e parcelar.")
+            parcelas_compra, erro_parcelas = editor_parcelas(
+                valor_total,
+                data_aceite,
+                chave=f"compra_parc_{versao_compra}_{tipo_selecionado['id']}_{proposta_escolhida or ''}",
+                vencimento_padrao=vencimento_sugerido or data_aceite + timedelta(days=30),
+            )
+            if erro_parcelas:
+                st.error(erro_parcelas)
+
+    a_prazo = modo_pagamento == A_PRAZO
+    if st.button(
+        "Registrar compra", type="primary",
+        disabled=itens_validos.empty or (a_prazo and bool(erro_parcelas)),
+    ):
+        if a_prazo:
             status = "pendente"
+            data_vencimento = parcelas_compra[0]["data_vencimento"]
             data_pagamento = None
         else:
             status = "pago"
+            data_vencimento = data_aceite
             data_pagamento = data_aceite
+            parcelas_compra = [{"numero": 1, "data_vencimento": data_aceite, "valor": valor_total}]
 
         try:
             # tudo numa transação: se algo falhar no meio, nenhuma peça fica pela metade
@@ -333,6 +363,17 @@ with aba_compra:
                     fetch=True,
                 )
                 compra_id = compra[0]["id"]
+
+                for parcela in parcelas_compra:
+                    executar(
+                        """
+                        INSERT INTO compra_parcela
+                            (compra_id, numero, valor, data_vencimento, status, data_pagamento)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (compra_id, parcela["numero"], parcela["valor"], parcela["data_vencimento"],
+                         status, data_pagamento),
+                    )
 
                 for _, item in itens_validos.iterrows():
                     produto = executar(
@@ -379,10 +420,17 @@ with aba_compra:
         except Exception as e:
             st.error(f"Não foi possível registrar a compra. Nada foi gravado. Erro: {e}")
         else:
+            if not a_prazo:
+                pagamento_txt = ", paga à vista."
+            elif len(parcelas_compra) == 1:
+                pagamento_txt = f", vence em {fmt_data(data_vencimento)}."
+            else:
+                pagamento_txt = (
+                    f", em {len(parcelas_compra)} parcelas (1ª vence em {fmt_data(data_vencimento)})."
+                )
             st.session_state["compra_sucesso"] = (
                 f"Compra #{compra_id} registrada com {len(itens_validos)} peça(s), "
-                f"total R$ {valor_total:.2f}"
-                + (f", vence em {fmt_data(data_vencimento)}." if data_vencimento else ".")
+                f"total {brl(valor_total)}" + pagamento_txt
             )
             st.session_state.compra_version += 1
             st.rerun()
@@ -397,70 +445,120 @@ with aba_compra:
     compras = run_query(
         """
         SELECT c.id, tc.nome AS tipo_compra, COALESCE(f.nome, '—') AS fornecedora,
-               c.data_aceite, c.valor_total, c.data_vencimento, c.status, c.data_pagamento
+               c.data_aceite, c.valor_total, c.data_vencimento, c.status, c.data_pagamento,
+               COUNT(p.id) AS parcelas,
+               COUNT(p.id) FILTER (WHERE p.status = 'pago') AS pagas,
+               COALESCE(SUM(p.valor) FILTER (WHERE p.status = 'pendente'), 0) AS em_aberto
         FROM compra c
         JOIN tipo_compra tc ON tc.id = c.tipo_compra_id
         LEFT JOIN fornecedora f ON f.id = c.fornecedora_id
+        LEFT JOIN compra_parcela p ON p.compra_id = c.id
+        GROUP BY c.id, tc.nome, f.nome
         ORDER BY c.data_aceite DESC, c.id DESC
         LIMIT 30
         """
     )
 
     if compras:
-        st.dataframe(compras, use_container_width=True, hide_index=True)
-        st.caption("Pra pagar uma compra em aberto, use a aba Controle de pagamentos (peças).")
+        st.dataframe(
+            [
+                {
+                    "Compra": f"#{c['id']}",
+                    "Tipo de compra": c["tipo_compra"],
+                    "Fornecedora": c["fornecedora"],
+                    "Data da compra": fmt_data(c["data_aceite"]),
+                    "Valor total": brl(c["valor_total"]),
+                    "Parcelas pagas": f"{c['pagas']}/{c['parcelas']}",
+                    "Em aberto": brl(c["em_aberto"]) if c["em_aberto"] else "—",
+                    "Próximo vencimento": fmt_data(c["data_vencimento"]) if c["status"] == "pendente" else "—",
+                    "Situação": "Paga" if c["status"] == "pago" else "Em aberto",
+                    "Quitada em": fmt_data(c["data_pagamento"]) if c["status"] == "pago" else "—",
+                }
+                for c in compras
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Pra pagar uma parcela em aberto, use a aba Controle de pagamentos (peças).")
     else:
         st.info("Nenhuma compra registrada ainda.")
 
-    # ---- editar vencimento de compras em aberto ----
-    compras_em_aberto = run_query(
-        """
-        SELECT c.id, COALESCE(f.nome, '—') AS fornecedora, c.data_aceite, c.data_vencimento, c.valor_total
-        FROM compra c
-        LEFT JOIN fornecedora f ON f.id = c.fornecedora_id
-        WHERE c.status = 'pendente'
-        ORDER BY c.data_vencimento NULLS LAST, c.id
-        """
-    )
-    if compras_em_aberto:
-        st.subheader("Editar data de vencimento")
-        st.caption("Só compras em aberto. Compras já pagas não têm o vencimento alterado.")
-
-        mensagem_venc = st.session_state.pop("venc_sucesso", None)
-        if mensagem_venc:
-            st.success(mensagem_venc)
-
-        opcoes_venc = {
-            f"Compra #{c['id']} — {c['fornecedora']} — {brl(c['valor_total'])} — "
-            f"vence {fmt_data(c['data_vencimento'])}": c
-            for c in compras_em_aberto
-        }
-        escolha_venc = st.selectbox("Compra", options=list(opcoes_venc.keys()), key="venc_edit_sel")
-        compra_venc = opcoes_venc[escolha_venc]
-        limite_inferior = min(d for d in (compra_venc["data_aceite"], compra_venc["data_vencimento"]) if d)
-        novo_vencimento = st.date_input(
-            "Novo vencimento",
-            value=compra_venc["data_vencimento"] or compra_venc["data_aceite"],
-            min_value=limite_inferior,
-            format="DD/MM/YYYY",
-            key=f"venc_edit_{compra_venc['id']}_{compra_venc['data_vencimento']}",
+    # ---- parcelas e vencimentos de compras em aberto ----
+    em_aberto = compras_em_aberto()
+    if em_aberto:
+        st.subheader("Parcelas e vencimentos")
+        st.caption(
+            "Para compras em aberto: mude vencimentos, valores ou o número de parcelas. "
+            "Parcelas já pagas não mudam."
         )
+
+        mensagem_parc = st.session_state.pop("reparc_sucesso", None)
+        if mensagem_parc:
+            st.success(mensagem_parc)
+
+        opcoes_reparc = {
+            f"Compra #{c['id']} — {c['fornecedora']} — {brl(c['valor_total'])} — "
+            f"{c['pagas']}/{c['parcelas']} parcela(s) paga(s) — próximo venc. {fmt_data(c['data_vencimento'])}": c
+            for c in em_aberto
+        }
+        escolha_reparc = st.selectbox("Compra", options=list(opcoes_reparc), key="reparc_sel")
+        compra_reparc = opcoes_reparc[escolha_reparc]
+        parcelas_atuais = parcelas_da_compra(compra_reparc["id"])
+        pagas = [p for p in parcelas_atuais if p["status"] == "pago"]
+        pendentes = [p for p in parcelas_atuais if p["status"] == "pendente"]
+
+        st.dataframe(
+            [
+                {
+                    "Parcela": f"{p['numero']}/{len(parcelas_atuais)}",
+                    "Vencimento": fmt_data(p["data_vencimento"]),
+                    "Valor": brl(p["valor"]),
+                    "Situação": "Paga" if p["status"] == "pago" else "Em aberto",
+                    "Paga em": fmt_data(p["data_pagamento"]) if p["status"] == "pago" else "—",
+                }
+                for p in parcelas_atuais
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        restante = sum((dec(p["valor"]) for p in pendentes), dec(0))
+        st.markdown(f"**Em aberto: {brl(restante)}** em {len(pendentes)} parcela(s).")
+        versao_reparc = st.session_state.setdefault("reparc_versao", 0)
+        data_minima = min([compra_reparc["data_aceite"]] + [p["data_vencimento"] for p in pendentes])
+        novas_parcelas, erro_reparc = editor_parcelas(
+            restante,
+            data_minima,
+            chave=f"reparc_{compra_reparc['id']}_{versao_reparc}",
+            quantidade_padrao=len(pendentes),
+            vencimento_padrao=pendentes[0]["data_vencimento"],
+            iniciais=pendentes,
+            rotulo_quantidade="Parcelas em aberto",
+        )
+        if erro_reparc:
+            st.error(erro_reparc)
+
+        sem_mudanca = not erro_reparc and [
+            (p["data_vencimento"], dec(p["valor"])) for p in novas_parcelas
+        ] == [(p["data_vencimento"], dec(p["valor"])) for p in sorted(pendentes, key=lambda x: (x["data_vencimento"], x["numero"]))]
         if st.button(
-            "Salvar vencimento",
-            key="venc_edit_salvar",
-            disabled=novo_vencimento == compra_venc["data_vencimento"],
+            "Salvar parcelas", key="reparc_salvar", type="primary",
+            disabled=bool(erro_reparc) or sem_mudanca,
         ):
-            atualizada = run_query(
-                "UPDATE compra SET data_vencimento = %s WHERE id = %s AND status = 'pendente' RETURNING id",
-                (novo_vencimento, compra_venc["id"]),
-            )
-            if atualizada:
-                st.session_state["venc_sucesso"] = (
-                    f"Vencimento da compra #{compra_venc['id']} alterado para {fmt_data(novo_vencimento)}."
-                )
-                st.rerun()
+            try:
+                reparcelar(compra_reparc["id"], [p["id"] for p in pendentes], novas_parcelas)
+            except ParcelasAlteradasError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Não foi possível salvar. Nada foi gravado. Erro: {e}")
             else:
-                st.error("Essa compra já foi paga — o vencimento não pode mais ser alterado.")
+                st.session_state["reparc_sucesso"] = (
+                    f"Parcelas da compra #{compra_reparc['id']} atualizadas: "
+                    f"{len(novas_parcelas)} parcela(s) em aberto, 1ª vence em "
+                    f"{fmt_data(novas_parcelas[0]['data_vencimento'])}."
+                )
+                st.session_state["reparc_versao"] = versao_reparc + 1
+                st.rerun()
 
 # ================================================================
 # Aba: Avaliação de Peças

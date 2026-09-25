@@ -51,6 +51,22 @@ def _carregar(inicio, fim):
             fetch=True,
         )[0]
 
+        # devoluções entram na data da devolução: tiram receita e devolvem o custo da peça
+        devolucoes = q(
+            """
+            SELECT (SELECT COUNT(*) FROM devolucao WHERE data BETWEEN %s AND %s) AS qtd,
+                   (SELECT COALESCE(SUM(valor_devolvido), 0) FROM devolucao WHERE data BETWEEN %s AND %s) AS valor,
+                   COUNT(di.id) AS pecas,
+                   COALESCE(SUM(p.preco_custo), 0) AS custo
+            FROM devolucao d
+            JOIN devolucao_item di ON di.devolucao_id = d.id
+            JOIN produto p ON p.id = di.produto_id
+            WHERE d.data BETWEEN %s AND %s
+            """,
+            (inicio, fim, inicio, fim, inicio, fim),
+            fetch=True,
+        )[0]
+
         despesas = q(
             """
             SELECT COALESCE(SUM(valor), 0) AS total,
@@ -65,12 +81,12 @@ def _carregar(inicio, fim):
             fetch=True,
         )[0]
 
+        # compras de peças (fornecedoras, bazar...): por parcela
         fornecedoras_a_pagar = q(
             """
-            SELECT COALESCE(SUM(valor_total), 0) AS total, COUNT(*) AS qtd
-            FROM compra
-            WHERE status = 'pendente' AND fornecedora_id IS NOT NULL
-              AND data_vencimento BETWEEN %s AND %s
+            SELECT COALESCE(SUM(valor), 0) AS total, COUNT(*) AS qtd
+            FROM compra_parcela
+            WHERE status = 'pendente' AND data_vencimento BETWEEN %s AND %s
             """,
             (inicio, fim),
             fetch=True,
@@ -80,15 +96,15 @@ def _carregar(inicio, fim):
         fornecedoras_pagas = q(
             """
             SELECT COALESCE(SUM(
-                       CASE WHEN c.baixa_id IS NULL THEN c.valor_total
+                       CASE WHEN p.baixa_id IS NULL THEN p.valor
                             WHEN b.valor_bruto = 0 THEN 0
-                            ELSE c.valor_total * b.valor_pago / b.valor_bruto END
+                            ELSE p.valor * b.valor_pago / b.valor_bruto END
                    ), 0) AS total,
                    COUNT(*) AS qtd
-            FROM compra c
-            LEFT JOIN baixa_compra b ON b.id = c.baixa_id
-            WHERE c.status = 'pago' AND c.fornecedora_id IS NOT NULL
-              AND c.data_pagamento BETWEEN %s AND %s
+            FROM compra_parcela p
+            LEFT JOIN baixa_compra b ON b.id = p.baixa_id
+            WHERE p.status = 'pago'
+              AND p.data_pagamento BETWEEN %s AND %s
             """,
             (inicio, fim),
             fetch=True,
@@ -101,16 +117,23 @@ def _carregar(inicio, fim):
             fetch=True,
         )
         serie_fornecedoras = q(
-            "SELECT data_vencimento AS dia, SUM(valor_total) AS total FROM compra "
-            "WHERE status = 'pendente' AND fornecedora_id IS NOT NULL "
+            "SELECT data_vencimento AS dia, SUM(valor) AS total FROM compra_parcela "
+            "WHERE status = 'pendente' "
             "AND data_vencimento BETWEEN %s AND %s GROUP BY data_vencimento",
             (inicio, fim),
             fetch=True,
         )
         serie_vendas = q(
-            "SELECT v.data_venda::date AS dia, SUM(v.valor_total) AS total FROM venda v "
-            "WHERE v.data_venda::date BETWEEN %s AND %s GROUP BY 1",
-            (inicio, fim),
+            """
+            SELECT dia, SUM(total) AS total FROM (
+                SELECT v.data_venda::date AS dia, v.valor_total AS total FROM venda v
+                WHERE v.data_venda::date BETWEEN %s AND %s
+                UNION ALL
+                SELECT d.data, -d.valor_devolvido FROM devolucao d
+                WHERE d.data BETWEEN %s AND %s
+            ) x GROUP BY dia
+            """,
+            (inicio, fim, inicio, fim),
             fetch=True,
         )
 
@@ -122,6 +145,7 @@ def _carregar(inicio, fim):
             JOIN produto p ON p.id = iv.produto_id
             LEFT JOIN tipo_peca tp ON tp.id = p.tipo_peca_id
             WHERE v.data_venda::date BETWEEN %s AND %s
+              AND NOT EXISTS (SELECT 1 FROM devolucao_item di WHERE di.item_venda_id = iv.id)
             GROUP BY 1 ORDER BY qtd DESC, nome
             """,
             (inicio, fim),
@@ -134,6 +158,7 @@ def _carregar(inicio, fim):
             JOIN venda v ON v.id = iv.venda_id
             JOIN produto p ON p.id = iv.produto_id
             WHERE v.data_venda::date BETWEEN %s AND %s
+              AND NOT EXISTS (SELECT 1 FROM devolucao_item di WHERE di.item_venda_id = iv.id)
             GROUP BY 1 ORDER BY qtd DESC, nome
             """,
             (inicio, fim),
@@ -144,6 +169,7 @@ def _carregar(inicio, fim):
         "estoque": estoque,
         "vendas": vendas,
         "itens": itens,
+        "devolucoes": devolucoes,
         "despesas": despesas,
         "fornecedoras_a_pagar": fornecedoras_a_pagar,
         "fornecedoras_pagas": fornecedoras_pagas,
@@ -216,7 +242,7 @@ def _grafico_vendas_por_dia(dados, inicio, fim):
             for dia in _dias(inicio, fim)
         ]
     )
-    if df["valor"].sum() == 0:
+    if (df["valor"] == 0).all():
         st.info("Sem vendas nesse período.")
         return
 
@@ -323,8 +349,9 @@ def renderizar_painel():
     dados = _carregar(inicio, fim)
 
     estoque, vendas, itens, despesas = dados["estoque"], dados["vendas"], dados["itens"], dados["despesas"]
-    receita = Decimal(vendas["receita"])
-    custo = Decimal(itens["custo"])
+    devolucoes = dados["devolucoes"]
+    receita = Decimal(vendas["receita"]) - Decimal(devolucoes["valor"])
+    custo = Decimal(itens["custo"]) - Decimal(devolucoes["custo"])
     lucro_bruto = receita - custo
     margem_pct = (lucro_bruto / receita * 100) if receita else None
     resultado = lucro_bruto - Decimal(despesas["total"])
@@ -333,15 +360,19 @@ def renderizar_painel():
     _cartao(linha1[0], "Peças em estoque", estoque["pecas"], "posição de hoje")
     _cartao(linha1[1], "Capital em estoque", brl(estoque["capital"]), "custo das peças em estoque",
             "Soma do custo pago nas peças que ainda estão em estoque (posição de hoje).")
-    _cartao(linha1[2], "Vendas no período", vendas["qtd"], f"{itens['pecas']} peça(s) vendida(s)",
-            "Quantidade de vendas registradas no período.")
-    _cartao(linha1[3], "Receita (valor das vendas)", brl(receita), "líquida, após descontos",
-            "Soma do valor total das vendas do período, já com os descontos.")
+    legenda_vendas = f"{itens['pecas']} peça(s) vendida(s)"
+    if devolucoes["pecas"]:
+        legenda_vendas += f" · {devolucoes['pecas']} devolvida(s)"
+    _cartao(linha1[2], "Vendas no período", vendas["qtd"], legenda_vendas,
+            "Quantidade de vendas registradas no período. Peças devolvidas contam na data da devolução.")
+    _cartao(linha1[3], "Receita (valor das vendas)", brl(receita), "líquida, após descontos e devoluções",
+            "Valor total das vendas do período, já com os descontos, menos o valor devolvido "
+            "às clientes em devoluções feitas no período.")
     _cartao(
         linha1[4], "Margem bruta por peça",
         f"{margem_pct:.1f}%".replace(".", ",") if margem_pct is not None else "—",
         f"lucro bruto {brl(lucro_bruto)}",
-        "(Receita − custo das peças vendidas) ÷ Receita. Considera todas as peças vendidas no período.",
+        "(Receita − custo das peças vendidas) ÷ Receita. Peças devolvidas saem da receita e do custo.",
     )
 
     linha2 = st.columns(5)
@@ -351,19 +382,21 @@ def renderizar_painel():
     _cartao(linha2[1], "Despesas a pagar", brl(despesas["a_pagar"]), f"{despesas['a_pagar_qtd']} lançamento(s)",
             "Despesas pendentes com data dentro do período.")
     _cartao(linha2[2], "Fornecedoras a pagar", brl(dados["fornecedoras_a_pagar"]["total"]),
-            f"{dados['fornecedoras_a_pagar']['qtd']} compra(s)",
-            "Compras de fornecedoras ainda não pagas com vencimento no período (inclui as já vencidas).")
+            f"{dados['fornecedoras_a_pagar']['qtd']} parcela(s)",
+            "Parcelas de compras de peças ainda não pagas com vencimento no período (inclui as "
+            "já vencidas). Compra à vista conta como 1 parcela; inclui bazar parcelado.")
     _cartao(linha2[3], "Despesas pagas", brl(despesas["pagas"]), f"{despesas['pagas_qtd']} lançamento(s)",
             "Despesas pagas com data dentro do período.")
     _cartao(linha2[4], "Fornecedoras pagas", brl(dados["fornecedoras_pagas"]["total"]),
-            f"{dados['fornecedoras_pagas']['qtd']} compra(s)",
-            "Compras de fornecedoras pagas no período, já com o desconto do pagamento.")
+            f"{dados['fornecedoras_pagas']['qtd']} parcela(s)",
+            "Parcelas de compras de peças pagas no período (inclui compras à vista, como bazar), "
+            "já com o desconto do pagamento.")
 
     st.divider()
     st.subheader("Despesas e fornecedoras a pagar por dia")
     _grafico_a_pagar_por_dia(dados, inicio, fim)
 
-    st.subheader("Vendas por dia")
+    st.subheader("Vendas por dia (líquidas de devoluções)")
     _grafico_vendas_por_dia(dados, inicio, fim)
 
     col_pizza, col_barras = st.columns(2)

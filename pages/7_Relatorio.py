@@ -57,8 +57,23 @@ despesas_resumo = run_query(
     (data_inicio, data_fim),
 )[0]
 
-receita_liquida = float(receita_resumo["liquida"])
-cpv = float(cpv_total)
+# devoluções entram na data da devolução: tiram receita e devolvem o custo da peça
+devolucoes_resumo = run_query(
+    """
+    SELECT (SELECT COUNT(*) FROM devolucao WHERE data BETWEEN %s AND %s) AS qtd,
+           (SELECT COALESCE(SUM(valor_devolvido), 0) FROM devolucao WHERE data BETWEEN %s AND %s) AS valor,
+           (SELECT COALESCE(SUM(p.preco_custo), 0)
+              FROM devolucao d
+              JOIN devolucao_item di ON di.devolucao_id = d.id
+              JOIN produto p ON p.id = di.produto_id
+             WHERE d.data BETWEEN %s AND %s) AS custo
+    """,
+    (data_inicio, data_fim, data_inicio, data_fim, data_inicio, data_fim),
+)[0]
+
+devolucoes_valor = float(devolucoes_resumo["valor"])
+receita_liquida = float(receita_resumo["liquida"]) - devolucoes_valor
+cpv = float(cpv_total) - float(devolucoes_resumo["custo"])
 despesas_total = float(despesas_resumo["total"])
 margem_bruta = receita_liquida - cpv
 margem_pct = (margem_bruta / receita_liquida * 100) if receita_liquida else 0.0
@@ -72,7 +87,11 @@ col3.metric("Margem bruta", f"R$ {margem_bruta:.2f}", f"{margem_pct:.1f}%")
 col4.metric("Despesas", f"R$ {despesas_total:.2f}", f"{despesas_resumo['qtd']} lançamento(s)")
 
 st.metric("Resultado líquido do período", f"R$ {resultado_liquido:.2f}")
-st.caption(f"Descontos concedidos no período: R$ {float(receita_resumo['descontos']):.2f}")
+st.caption(
+    f"Descontos concedidos no período: R$ {float(receita_resumo['descontos']):.2f}. "
+    f"Devoluções no período: {devolucoes_resumo['qtd']} (R$ {devolucoes_valor:.2f} devolvidos às clientes), "
+    "já descontadas da receita e do custo acima."
+)
 
 # ------------------------------------------------------------
 # Receita histórica (planilha migrada, sem custo/despesa registrados)
@@ -112,7 +131,7 @@ st.divider()
 st.subheader("Contas em aberto (hoje)")
 
 compras_pendentes = run_query(
-    "SELECT COUNT(*) AS qtd, COALESCE(SUM(valor_total), 0) AS total FROM compra WHERE status = 'pendente'"
+    "SELECT COUNT(*) AS qtd, COALESCE(SUM(valor), 0) AS total FROM compra_parcela WHERE status = 'pendente'"
 )[0]
 despesas_pendentes = run_query(
     "SELECT COUNT(*) AS qtd, COALESCE(SUM(valor), 0) AS total FROM despesa WHERE status_pagamento = 'pendente'"
@@ -122,7 +141,7 @@ col1, col2 = st.columns(2)
 col1.metric(
     "A pagar a fornecedoras",
     f"R$ {float(compras_pendentes['total']):.2f}",
-    f"{compras_pendentes['qtd']} compra(s)",
+    f"{compras_pendentes['qtd']} parcela(s)",
 )
 col2.metric(
     "Despesas pendentes",
@@ -141,14 +160,22 @@ with col1:
     st.subheader("Receita por tipo")
     receita_por_tipo = run_query(
         """
-        SELECT COALESCE(pc.nome, 'Sem classificação') AS conta, COALESCE(SUM(v.valor_total), 0) AS total
-        FROM venda v
-        LEFT JOIN plano_contas pc ON pc.id = v.plano_conta_id
-        WHERE v.data_venda::date BETWEEN %s AND %s
+        SELECT conta, SUM(total) AS total FROM (
+            SELECT COALESCE(pc.nome, 'Sem classificação') AS conta, v.valor_total AS total
+            FROM venda v
+            LEFT JOIN plano_contas pc ON pc.id = v.plano_conta_id
+            WHERE v.data_venda::date BETWEEN %s AND %s
+            UNION ALL
+            SELECT COALESCE(pc.nome, 'Sem classificação'), -d.valor_devolvido
+            FROM devolucao d
+            JOIN venda v ON v.id = d.venda_id
+            LEFT JOIN plano_contas pc ON pc.id = v.plano_conta_id
+            WHERE d.data BETWEEN %s AND %s
+        ) x
         GROUP BY conta
         ORDER BY total DESC
         """,
-        (data_inicio, data_fim),
+        (data_inicio, data_fim, data_inicio, data_fim),
     )
     if receita_por_tipo or receita_historica:
         df_receita = pd.DataFrame(receita_por_tipo).set_index("conta") if receita_por_tipo else pd.DataFrame(columns=["total"])
@@ -189,9 +216,15 @@ st.subheader("Tendência — últimos 6 meses")
 
 receita_mensal = run_query(
     """
-    SELECT date_trunc('month', data_venda)::date AS mes, COALESCE(SUM(valor_total), 0) AS receita
-    FROM venda
-    WHERE data_venda >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+    SELECT mes, SUM(valor) AS receita FROM (
+        SELECT date_trunc('month', data_venda)::date AS mes, valor_total AS valor
+        FROM venda
+        WHERE data_venda >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+        UNION ALL
+        SELECT date_trunc('month', data)::date, -valor_devolvido
+        FROM devolucao
+        WHERE data >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+    ) x
     GROUP BY 1 ORDER BY 1
     """
 )
@@ -205,11 +238,19 @@ despesas_mensal = run_query(
 )
 cpv_mensal = run_query(
     """
-    SELECT date_trunc('month', v.data_venda)::date AS mes, COALESCE(SUM(p.preco_custo), 0) AS cpv
-    FROM item_venda iv
-    JOIN venda v ON v.id = iv.venda_id
-    JOIN produto p ON p.id = iv.produto_id
-    WHERE v.data_venda >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+    SELECT mes, SUM(custo) AS cpv FROM (
+        SELECT date_trunc('month', v.data_venda)::date AS mes, p.preco_custo AS custo
+        FROM item_venda iv
+        JOIN venda v ON v.id = iv.venda_id
+        JOIN produto p ON p.id = iv.produto_id
+        WHERE v.data_venda >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+        UNION ALL
+        SELECT date_trunc('month', d.data)::date, -p.preco_custo
+        FROM devolucao d
+        JOIN devolucao_item di ON di.devolucao_id = d.id
+        JOIN produto p ON p.id = di.produto_id
+        WHERE d.data >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+    ) x
     GROUP BY 1 ORDER BY 1
     """
 )
@@ -276,7 +317,9 @@ vendas_detalhe = run_query(
 )
 despesas_detalhe = run_query(
     """
-    SELECT d.id, d.data, pc.nome AS categoria, d.descricao, d.valor, d.status_pagamento
+    SELECT d.id, d.data, pc.nome AS categoria, d.descricao, d.valor, d.status_pagamento,
+           CASE WHEN d.parcelamento_id IS NOT NULL
+                THEN d.parcela_numero || '/' || d.parcela_total END AS parcela
     FROM despesa d
     JOIN plano_contas pc ON pc.id = d.plano_conta_id
     WHERE d.data BETWEEN %s AND %s
@@ -296,6 +339,36 @@ compras_detalhe = run_query(
     """,
     (data_inicio, data_fim),
 )
+parcelas_detalhe = run_query(
+    """
+    SELECT p.compra_id AS compra, p.numero || '/' || t.total AS parcela,
+           COALESCE(f.nome, '—') AS fornecedora, tc.nome AS tipo_compra,
+           p.data_vencimento, p.valor, p.status, p.data_pagamento
+    FROM compra_parcela p
+    JOIN (SELECT compra_id, COUNT(*) AS total FROM compra_parcela GROUP BY compra_id) t ON t.compra_id = p.compra_id
+    JOIN compra c ON c.id = p.compra_id
+    JOIN tipo_compra tc ON tc.id = c.tipo_compra_id
+    LEFT JOIN fornecedora f ON f.id = c.fornecedora_id
+    WHERE p.data_vencimento BETWEEN %s AND %s
+       OR p.data_pagamento BETWEEN %s AND %s
+    ORDER BY p.data_vencimento, p.compra_id, p.numero
+    """,
+    (data_inicio, data_fim, data_inicio, data_fim),
+)
+devolucoes_detalhe = run_query(
+    """
+    SELECT d.id AS devolucao, d.data, d.venda_id AS venda, v.cliente,
+           string_agg('#' || di.produto_id::text, ', ' ORDER BY di.produto_id) AS pecas,
+           d.valor_devolvido, d.forma_reembolso, d.motivo
+    FROM devolucao d
+    JOIN venda v ON v.id = d.venda_id
+    JOIN devolucao_item di ON di.devolucao_id = d.id
+    WHERE d.data BETWEEN %s AND %s
+    GROUP BY d.id, v.cliente
+    ORDER BY d.data, d.id
+    """,
+    (data_inicio, data_fim),
+)
 historico_detalhe = run_query(
     """
     SELECT id, origem, data_venda, cliente, descricao, codigo, valor, forma_pagamento
@@ -309,6 +382,7 @@ historico_detalhe = run_query(
 resumo_df = pd.DataFrame(
     [
         {"indicador": "Receita líquida (sistema)", "valor": receita_liquida},
+        {"indicador": "Devoluções (valor devolvido às clientes)", "valor": devolucoes_valor},
         {"indicador": "Custo das peças vendidas", "valor": cpv},
         {"indicador": "Margem bruta", "valor": margem_bruta},
         {"indicador": "Margem bruta (%)", "valor": round(margem_pct, 1)},
@@ -331,6 +405,8 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
     pd.DataFrame(despesas_detalhe or []).to_excel(writer, sheet_name="Despesas", index=False)
     pd.DataFrame(compras_detalhe or []).to_excel(writer, sheet_name="Compras", index=False)
+    pd.DataFrame(parcelas_detalhe or []).to_excel(writer, sheet_name="Parcelas de compras", index=False)
+    pd.DataFrame(devolucoes_detalhe or []).to_excel(writer, sheet_name="Devoluções", index=False)
     pd.DataFrame(historico_detalhe or []).to_excel(writer, sheet_name="Histórico", index=False)
 buffer.seek(0)
 

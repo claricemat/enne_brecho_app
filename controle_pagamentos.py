@@ -1,9 +1,9 @@
 """Aba "Controle de pagamentos (peças)" da página de Compras.
 
-Mostra o que falta pagar às fornecedoras (a pagar / em atraso / total pago no
-período) e permite dar baixa nas compras escolhendo a fornecedora, aplicando
+Mostra o que falta pagar das compras de peças (a pagar / em atraso / total pago
+no período) e permite dar baixa nas parcelas escolhendo a fornecedora, aplicando
 desconto e combinando até duas formas de pagamento (conta bancária, caixa ou
-crédito na loja).
+crédito na loja). Uma compra à vista tem 1 parcela; uma parcelada, várias.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -22,7 +22,7 @@ _FUSO_BRASIL = timezone(timedelta(hours=-3))
 
 
 class ComprasJaPagasError(Exception):
-    """Alguma compra selecionada já foi paga (por exemplo, pela outra sócia)."""
+    """Alguma parcela selecionada já foi paga (por exemplo, pela outra sócia)."""
 
 
 # ----------------------------------------------------------------
@@ -45,18 +45,18 @@ def _carregar_dados(hoje, inicio, fim):
         resumo = q(
             """
             SELECT
-                (SELECT COALESCE(SUM(valor_total), 0) FROM compra
+                (SELECT COALESCE(SUM(valor), 0) FROM compra_parcela
                   WHERE status = 'pendente' AND data_vencimento BETWEEN %s AND %s
                     AND data_vencimento >= %s) AS a_pagar,
-                (SELECT COALESCE(SUM(valor_total), 0) FROM compra
+                (SELECT COALESCE(SUM(valor), 0) FROM compra_parcela
                   WHERE status = 'pendente' AND data_vencimento BETWEEN %s AND %s
                     AND data_vencimento < %s) AS em_atraso,
-                (SELECT COALESCE(SUM(valor_total), 0) FROM compra
+                (SELECT COALESCE(SUM(valor), 0) FROM compra_parcela
                   WHERE status = 'pendente' AND data_vencimento < %s
                     AND data_vencimento NOT BETWEEN %s AND %s) AS atraso_fora_periodo,
                 (SELECT COALESCE(SUM(valor_pago), 0) FROM baixa_compra
                   WHERE data_pagamento BETWEEN %s AND %s)
-                + (SELECT COALESCE(SUM(valor_total), 0) FROM compra
+                + (SELECT COALESCE(SUM(valor), 0) FROM compra_parcela
                     WHERE status = 'pago' AND baixa_id IS NULL
                       AND data_pagamento BETWEEN %s AND %s) AS total_pago,
                 (SELECT COALESCE(SUM(desconto), 0) FROM baixa_compra
@@ -75,14 +75,17 @@ def _carregar_dados(hoje, inicio, fim):
 
         pendentes = q(
             """
-            SELECT c.id, c.fornecedora_id,
+            SELECT p.id, p.compra_id, p.numero,
+                   (SELECT COUNT(*) FROM compra_parcela x WHERE x.compra_id = p.compra_id) AS total_parcelas,
+                   c.fornecedora_id,
                    COALESCE(f.nome, '— sem fornecedora —') AS fornecedora,
-                   tc.nome AS tipo_compra, c.data_aceite, c.data_vencimento, c.valor_total
-            FROM compra c
+                   tc.nome AS tipo_compra, c.data_aceite, p.data_vencimento, p.valor
+            FROM compra_parcela p
+            JOIN compra c ON c.id = p.compra_id
             JOIN tipo_compra tc ON tc.id = c.tipo_compra_id
             LEFT JOIN fornecedora f ON f.id = c.fornecedora_id
-            WHERE c.status = 'pendente'
-            ORDER BY f.nome NULLS LAST, c.data_vencimento NULLS LAST, c.id
+            WHERE p.status = 'pendente'
+            ORDER BY f.nome NULLS LAST, p.data_vencimento, p.compra_id, p.numero
             """,
             fetch=True,
         )
@@ -101,18 +104,21 @@ def _carregar_dados(hoje, inicio, fim):
 
         compras_periodo = q(
             """
-            SELECT c.id, COALESCE(f.nome, '—') AS fornecedora, tc.nome AS tipo_compra,
-                   c.data_aceite, c.data_vencimento, c.status, c.data_pagamento, c.valor_total,
-                   -- pagas com desconto: rateia o desconto da baixa entre as compras dela
-                   CASE WHEN c.baixa_id IS NULL THEN c.valor_total
+            SELECT c.id, p.numero,
+                   (SELECT COUNT(*) FROM compra_parcela x WHERE x.compra_id = p.compra_id) AS total_parcelas,
+                   COALESCE(f.nome, '—') AS fornecedora, tc.nome AS tipo_compra,
+                   c.data_aceite, p.data_vencimento, p.status, p.data_pagamento, p.valor,
+                   -- pagas com desconto: rateia o desconto da baixa entre as parcelas dela
+                   CASE WHEN p.baixa_id IS NULL THEN p.valor
                         WHEN b.valor_bruto = 0 THEN 0
-                        ELSE c.valor_total * b.valor_pago / b.valor_bruto END AS valor_liquido
-            FROM compra c
+                        ELSE p.valor * b.valor_pago / b.valor_bruto END AS valor_liquido
+            FROM compra_parcela p
+            JOIN compra c ON c.id = p.compra_id
             JOIN tipo_compra tc ON tc.id = c.tipo_compra_id
             LEFT JOIN fornecedora f ON f.id = c.fornecedora_id
-            LEFT JOIN baixa_compra b ON b.id = c.baixa_id
-            WHERE (c.status = 'pendente' AND c.data_vencimento BETWEEN %s AND %s)
-               OR (c.status = 'pago' AND c.data_pagamento BETWEEN %s AND %s)
+            LEFT JOIN baixa_compra b ON b.id = p.baixa_id
+            WHERE (p.status = 'pendente' AND p.data_vencimento BETWEEN %s AND %s)
+               OR (p.status = 'pago' AND p.data_pagamento BETWEEN %s AND %s)
             """,
             (inicio, fim, inicio, fim),
             fetch=True,
@@ -121,8 +127,14 @@ def _carregar_dados(hoje, inicio, fim):
         historico = q(
             """
             SELECT b.id, b.data_pagamento, COALESCE(f.nome, '—') AS fornecedora,
-                   (SELECT string_agg('#' || c.id, ', ' ORDER BY c.id)
-                      FROM compra c WHERE c.baixa_id = b.id) AS compras,
+                   (SELECT string_agg(
+                               '#' || p.compra_id
+                               || CASE WHEN t.total > 1 THEN ' (' || p.numero || '/' || t.total || ')' ELSE '' END,
+                               ', ' ORDER BY p.compra_id, p.numero)
+                      FROM compra_parcela p
+                      JOIN (SELECT compra_id, COUNT(*) AS total FROM compra_parcela GROUP BY compra_id) t
+                        ON t.compra_id = p.compra_id
+                     WHERE p.baixa_id = b.id) AS compras,
                    b.valor_bruto, b.desconto, b.valor_pago,
                    (SELECT string_agg(
                                COALESCE(cf.nome, 'Crédito na loja') || ' R$ ' || bf.valor::text,
@@ -153,18 +165,25 @@ def _carregar_dados(hoje, inicio, fim):
 # ----------------------------------------------------------------
 # Escrita (transação única: ou grava tudo, ou nada)
 # ----------------------------------------------------------------
-def _registrar_pagamento(fornecedora_id, ids_compras, data_pagamento, valor_bruto,
-                         desconto, formas, observacao, usuario):
+def _rotulo_parcela(p):
+    """'#12' para compra à vista; '#12 (2/3)' para parcela de compra parcelada."""
+    if p["total_parcelas"] > 1:
+        return f"#{p['compra_id']} ({p['numero']}/{p['total_parcelas']})"
+    return f"#{p['compra_id']}"
+
+
+def _registrar_pagamento(fornecedora_id, ids_parcelas, data_pagamento, valor_bruto,
+                         desconto, formas, observacao, usuario, descricao_parcelas):
     with transacao() as executar:
-        # trava as compras e confere que ninguém pagou enquanto esta tela estava aberta
+        # trava as parcelas e confere que ninguém pagou enquanto esta tela estava aberta
         travadas = executar(
-            "SELECT id FROM compra WHERE id = ANY(%s) AND status = 'pendente' FOR UPDATE",
-            (ids_compras,),
+            "SELECT id FROM compra_parcela WHERE id = ANY(%s) AND status = 'pendente' FOR UPDATE",
+            (ids_parcelas,),
             fetch=True,
         )
-        if len(travadas) != len(ids_compras):
+        if len(travadas) != len(ids_parcelas):
             raise ComprasJaPagasError(
-                "Alguma das compras selecionadas já foi paga (talvez pela outra pessoa). "
+                "Alguma das parcelas selecionadas já foi paga ou alterada (talvez pela outra pessoa). "
                 "Atualize a página e confira antes de pagar de novo."
             )
 
@@ -194,13 +213,14 @@ def _registrar_pagamento(fornecedora_id, ids_compras, data_pagamento, valor_brut
                     VALUES (%s, 'entrada', %s, %s, %s, %s)
                     """,
                     (fornecedora_id, valor, data_pagamento, baixa_id,
-                     f"Pagamento das compras {', '.join('#' + str(i) for i in ids_compras)}"),
+                     f"Pagamento das compras {descricao_parcelas}"),
                 )
 
+        # a situação da compra (paga / em aberto) é atualizada pelo banco a partir das parcelas
         executar(
-            "UPDATE compra SET status = 'pago', data_pagamento = %s, baixa_id = %s "
+            "UPDATE compra_parcela SET status = 'pago', data_pagamento = %s, baixa_id = %s "
             "WHERE id = ANY(%s)",
-            (data_pagamento, baixa_id, ids_compras),
+            (data_pagamento, baixa_id, ids_parcelas),
         )
     return baixa_id
 
@@ -211,8 +231,8 @@ def _registrar_pagamento(fornecedora_id, ids_compras, data_pagamento, valor_brut
 def renderizar_controle_pagamentos():
     hoje = _hoje()
     st.caption(
-        "Acompanhe o que falta pagar às fornecedoras e dê baixa nas compras, com "
-        "desconto e até duas formas de pagamento."
+        "Acompanhe o que falta pagar das compras de peças e dê baixa nas parcelas, com "
+        "desconto e até duas formas de pagamento. Compra à vista = 1 parcela."
     )
 
     mensagem = st.session_state.pop("pag_sucesso", None)
@@ -239,11 +259,11 @@ def renderizar_controle_pagamentos():
     col1, col2, col3 = st.columns(3)
     with col1.container(border=True):
         st.metric("A pagar (em aberto)", _brl(resumo["a_pagar"]),
-                  help="Compras pendentes com vencimento no período que ainda não venceram.")
+                  help="Parcelas em aberto com vencimento no período que ainda não venceram.")
         _botao_visao("aberto")
     with col2.container(border=True):
         st.metric("Em atraso", _brl(resumo["em_atraso"]),
-                  help="Compras pendentes com vencimento no período que já venceram.")
+                  help="Parcelas em aberto com vencimento no período que já venceram.")
         _botao_visao("atraso")
     with col3.container(border=True):
         st.metric("Total pago", _brl(resumo["total_pago"]),
@@ -265,10 +285,10 @@ def renderizar_controle_pagamentos():
     # ---- pagar fornecedora ----
     st.divider()
     st.subheader("Pagar fornecedora")
-    st.caption("Aqui aparecem todas as compras em aberto, independentemente do período acima.")
+    st.caption("Aqui aparecem todas as parcelas em aberto, independentemente do período acima.")
 
     if not dados["pendentes"]:
-        st.success("Nenhuma compra em aberto. Tudo pago!")
+        st.success("Nenhuma parcela em aberto. Tudo pago!")
     else:
         _formulario_pagamento(dados, hoje)
 
@@ -328,6 +348,7 @@ def _linhas_tabela(compras_periodo, hoje, visao):
         valor = c["valor_liquido"]
         linhas.append({
             "id": c["id"],
+            "parcela": f"{c['numero']}/{c['total_parcelas']}",
             "fornecedora": c["fornecedora"],
             "tipo_compra": c["tipo_compra"],
             "data_aceite": c["data_aceite"],
@@ -335,9 +356,9 @@ def _linhas_tabela(compras_periodo, hoje, visao):
             "situacao": situacao,
             "data_pagamento": c["data_pagamento"] if situacao == "Pago" else None,
             "valor": valor,
-            "desconto": (c["valor_total"] - valor) if situacao == "Pago" else Decimal("0"),
+            "desconto": (c["valor"] - valor) if situacao == "Pago" else Decimal("0"),
         })
-    linhas.sort(key=lambda l: (l["valor"], l["id"]), reverse=True)
+    linhas.sort(key=lambda l: (l["valor"], l["id"], l["parcela"]), reverse=True)
     return linhas
 
 
@@ -348,6 +369,7 @@ def _tabela_compras(compras_periodo, hoje, inicio, fim):
     st.subheader("Compras do período")
     st.caption(
         f"{_fmt_data(inicio)} a {_fmt_data(fim)} — {rotulo_visao}. "
+        "Uma linha por parcela (compra à vista = 1/1). "
         "Use o botão \"Ver compras\" de um cartão para filtrar; ordenadas do maior para o menor valor."
     )
 
@@ -359,6 +381,7 @@ def _tabela_compras(compras_periodo, hoje, inicio, fim):
     exibicao = [
         {
             "Compra": f"#{l['id']}",
+            "Parcela": l["parcela"],
             "Fornecedora": l["fornecedora"],
             "Tipo de compra": l["tipo_compra"],
             "Data da compra": _fmt_data(l["data_aceite"]),
@@ -378,7 +401,7 @@ def _tabela_compras(compras_periodo, hoje, inicio, fim):
         subtotal = sum((l["valor"] for l in linhas if l["situacao"] == situacao), Decimal("0"))
         if any(l["situacao"] == situacao for l in linhas):
             totais.append((situacao, subtotal))
-    st.caption(f"{len(linhas)} compra(s) — " + " · ".join(f"{s}: {_brl(t)}" for s, t in totais))
+    st.caption(f"{len(linhas)} parcela(s) — " + " · ".join(f"{s}: {_brl(t)}" for s, t in totais))
 
     periodo_txt = f"{_fmt_data(inicio)} a {_fmt_data(fim)}"
     nome_base = f"compras_{visao or 'todas'}_{inicio.isoformat()}_{fim.isoformat()}"
@@ -402,16 +425,16 @@ def _tabela_compras(compras_periodo, hoje, inicio, fim):
 def _formulario_pagamento(dados, hoje):
     versao = st.session_state.setdefault("pag_versao", 0)
 
-    # agrupa as compras pendentes por fornecedora (mantém a ordem da consulta)
+    # agrupa as parcelas em aberto por fornecedora (mantém a ordem da consulta)
     por_fornecedora = {}
     for c in dados["pendentes"]:
         por_fornecedora.setdefault(c["fornecedora_id"], []).append(c)
 
     opcoes_fornecedora = {}
     for forn_id, compras in por_fornecedora.items():
-        em_aberto = sum((c["valor_total"] for c in compras), Decimal("0"))
+        em_aberto = sum((c["valor"] for c in compras), Decimal("0"))
         em_atraso = sum(
-            (c["valor_total"] for c in compras if c["data_vencimento"] and c["data_vencimento"] < hoje),
+            (c["valor"] for c in compras if c["data_vencimento"] and c["data_vencimento"] < hoje),
             Decimal("0"),
         )
         rotulo = f"{compras[0]['fornecedora']} — {_brl(em_aberto)} em aberto"
@@ -427,29 +450,31 @@ def _formulario_pagamento(dados, hoje):
     if fornecedora_id is not None and credito and credito > 0:
         st.caption(f"Crédito na loja já concedido a ela: {_brl(credito)}")
 
-    # ---- compras a pagar ----
+    # ---- parcelas a pagar ----
     opcoes_compra = {}
     for c in compras_forn:
+        parcela_txt = f" — parcela {c['numero']}/{c['total_parcelas']}" if c["total_parcelas"] > 1 else ""
         rotulo = (
-            f"Compra #{c['id']} — {c['tipo_compra']} — "
-            f"venc. {_fmt_data(c['data_vencimento'])} — {_brl(c['valor_total'])}"
+            f"Compra #{c['compra_id']}{parcela_txt} — {c['tipo_compra']} — "
+            f"venc. {_fmt_data(c['data_vencimento'])} — {_brl(c['valor'])}"
         )
         if c["data_vencimento"] and c["data_vencimento"] < hoje:
             rotulo += " (em atraso)"
         opcoes_compra[rotulo] = c["id"]
 
     selecionadas = st.multiselect(
-        "Compras a pagar",
+        "Parcelas a pagar",
         options=list(opcoes_compra),
         default=list(opcoes_compra) if len(opcoes_compra) == 1 else [],
         key=f"pag_compras_{versao}_{fornecedora_id}",
     )
     if not selecionadas:
-        st.info("Selecione ao menos uma compra para dar baixa.")
+        st.info("Selecione ao menos uma parcela para dar baixa.")
         return
 
     ids = [opcoes_compra[r] for r in selecionadas]
-    valor_bruto = sum((c["valor_total"] for c in compras_forn if c["id"] in ids), Decimal("0"))
+    parcelas_escolhidas = [c for c in compras_forn if c["id"] in ids]
+    valor_bruto = sum((c["valor"] for c in parcelas_escolhidas), Decimal("0"))
     chave = f"{versao}_{fornecedora_id}_{'-'.join(map(str, ids))}"
 
     # ---- data e desconto ----
@@ -466,7 +491,7 @@ def _formulario_pagamento(dados, hoje):
     valor_a_pagar = valor_bruto - desconto
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Total das compras", _brl(valor_bruto))
+    m1.metric("Total das parcelas", _brl(valor_bruto))
     m2.metric("Desconto", _brl(desconto))
     m3.metric("Total a pagar", _brl(valor_a_pagar))
 
@@ -538,6 +563,7 @@ def _formulario_pagamento(dados, hoje):
             _registrar_pagamento(
                 fornecedora_id, ids, data_pagamento, valor_bruto, desconto,
                 formas_escolhidas, observacao.strip(), st.session_state.get("usuario"),
+                ", ".join(_rotulo_parcela(c) for c in parcelas_escolhidas),
             )
         except ComprasJaPagasError as e:
             st.error(str(e))
@@ -547,7 +573,7 @@ def _formulario_pagamento(dados, hoje):
             return
 
         st.session_state["pag_sucesso"] = (
-            f"Pagamento registrado: {len(ids)} compra(s), {_brl(valor_a_pagar)} pagos"
+            f"Pagamento registrado: {len(ids)} parcela(s), {_brl(valor_a_pagar)} pagos"
             + (f" (desconto de {_brl(desconto)})" if desconto > 0 else "")
             + "."
         )

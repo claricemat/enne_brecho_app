@@ -26,7 +26,7 @@
 - `db.py` — conexão com o Postgres (Supabase) e função auxiliar `run_query`
 - `pages/1_Fornecedoras.py` — cadastro de fornecedoras
 - `pages/2_Compras.py` — registrar lote de compra (proposta aceita) e marcar pagamentos
-- `pages/3_Vendas.py` — registrar vendas de peças em estoque (busca por código/ID, descrição ou marca)
+- `pages/3_Vendas.py` — registrar vendas (busca por código/ID, descrição ou marca) e aba "Devolução de peças"
 - `pages/5_Estoque.py` — estoque + sub-aba "Gerador de etiquetas"
 - `pages/6_Cadastros.py` — tipos de peça, tipos de compra, plano de contas (Grupo › Subgrupo › Analítico) e contas/caixa
 - `pages/8_Financeiro.py` — conciliação bancária, importação de extrato OFX e resumo por plano de contas
@@ -34,12 +34,16 @@
 - `plano.py` — funções do plano de contas (grupos, subgrupos, rótulos)
 - `ofx_parser.py` — leitor de arquivos OFX (versões 1 e 2)
 - `financeiro.py` — importação do extrato e conciliação no banco
+- `parcelas.py` — parcelamento (divisão em parcelas e o bloco de tela usado em Compras e Despesas)
+- `compras_parcelas.py` — consulta e reparcelamento das parcelas de uma compra
+- `devolucoes.py` — devolução de peças vendidas (volta ao estoque e desconta da receita)
+- `pages/4_Despesas.py` — despesas à vista ou parceladas
 - `controle_pagamentos.py` — aba "Controle de pagamentos (peças)" da página de Compras (cartões, tabela filtrável, baixa com desconto e formas de pagamento combinadas)
 - `exportacao_compras.py` — exporta a tabela de compras em Excel e PDF
 - `pdf_avaliacao.py` — PDF com as duas propostas (A curto prazo / B longo prazo) enviado à fornecedora
 - `prazos_proposta.py` — prazos das propostas (10 dias / 30 dias úteis) e cálculo do vencimento
 - `formatacao.py` — valores e datas no padrão brasileiro
-- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_financeiro.sql` (plano de contas com subgrupo + extrato bancário)
+- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_parcelas_devolucao.sql` (parcelas de compras, despesas parceladas e devoluções)
 
 ## Deploy no Streamlit Community Cloud
 
