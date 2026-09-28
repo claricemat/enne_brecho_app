@@ -4,6 +4,16 @@ import streamlit as st
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# O banco (Supabase) e o servidor do Streamlit rodam em UTC. Sem isto, uma venda
+# feita depois das 21h (horário de Brasília) cairia no dia seguinte nas contas
+# por dia (painel, relatório, devoluções...). SET LOCAL vale só para a transação
+# atual, então funciona também com o pooler do Supabase.
+FUSO_HORARIO = "America/Sao_Paulo"
+
+
+def _usar_fuso_brasil(cur):
+    cur.execute("SET LOCAL TIME ZONE %s", (FUSO_HORARIO,))
+
 
 def _sanitize(value):
     """Converte tipos do numpy/pandas (numpy.float64, numpy.int64...) que vêm
@@ -32,6 +42,7 @@ def run_query(sql, params=None, fetch=True):
     conn = psycopg2.connect(st.secrets["DATABASE_URL"])
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _usar_fuso_brasil(cur)
             cur.execute(sql, params or ())
             rows = cur.fetchall() if fetch else None
         conn.commit()
@@ -59,6 +70,7 @@ def transacao():
     conn = psycopg2.connect(st.secrets["DATABASE_URL"])
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            _usar_fuso_brasil(cur)
 
             def executar(sql, params=None, fetch=False):
                 params = tuple(_sanitize(p) for p in params) if params else params

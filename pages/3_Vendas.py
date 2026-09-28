@@ -49,17 +49,46 @@ def _aba_registrar_venda():
         st.info("Não há peças em estoque no momento.")
         return
 
+    # ---- sacola da venda: peças marcadas, guardadas entre uma pesquisa e outra ----
+    # {código da peça: preço vendido}. Pesquisar outra coisa não tira nada daqui.
+    sacola = st.session_state.setdefault("venda_sacola", {})
+    versao_sacola = st.session_state.setdefault("venda_sacola_versao", 0)
+    produto_por_id = {p["id"]: p for p in produtos}
+
+    # peça que saiu do estoque enquanto estava na sacola (ex.: a outra pessoa vendeu)
+    fora_do_estoque = [pid for pid in sacola if pid not in produto_por_id]
+    if fora_do_estoque:
+        for pid in fora_do_estoque:
+            sacola.pop(pid)
+        st.warning(
+            "Saíram da sacola por não estarem mais no estoque: "
+            + ", ".join(f"#{pid}" for pid in fora_do_estoque) + "."
+        )
+
+    def _preco(valor, padrao):
+        valor = pd.to_numeric(valor, errors="coerce")
+        return float(padrao if pd.isna(valor) else valor)
+
     df_estoque = pd.DataFrame(produtos)
-    df_estoque.insert(0, "vender", False)
     # o banco devolve Decimal; a tabela e o desconto trabalham com número comum (float)
-    df_estoque["preco_venda"] = pd.to_numeric(df_estoque["preco_venda"], errors="coerce").astype(float)
-    df_estoque["preco_vendido"] = df_estoque["preco_venda"]
+    df_estoque["preco_venda"] = pd.to_numeric(df_estoque["preco_venda"], errors="coerce").fillna(0.0).astype(float)
+    df_estoque.insert(0, "vender", df_estoque["id"].isin(sacola))
+    df_estoque["preco_vendido"] = [
+        sacola.get(pid, preco) for pid, preco in zip(df_estoque["id"], df_estoque["preco_venda"])
+    ]
 
     busca = st.text_input(
         "Buscar peça (por código/ID, descrição ou marca)",
         placeholder="ex: 42, camisa azul, Farm",
-        help="O código é o número que está na etiqueta. Dá para digitar vários de uma vez: 12, 15, 20.",
+        help="O código é o número que está na etiqueta. Dá para digitar vários de uma vez: 12, 15, 20. "
+             "As peças marcadas continuam na sacola quando você pesquisa outra coisa.",
+        key=f"venda_busca_{st.session_state.venda_version}",
     )
+    # cada pesquisa nova abre a tabela "limpa", preenchida a partir da sacola
+    if st.session_state.get("venda_ultima_busca") != busca:
+        st.session_state["venda_ultima_busca"] = busca
+        st.session_state["venda_busca_n"] = st.session_state.get("venda_busca_n", 0) + 1
+
     if busca:
         termo = busca.strip()
         mascara = (
@@ -73,30 +102,88 @@ def _aba_registrar_venda():
         df_estoque = df_estoque[mascara].reset_index(drop=True)
 
     st.caption(
-        "Marque as peças vendidas nessa transação. O preço vem pré-preenchido com o "
-        "preço de venda, mas pode ser ajustado (ex: negociação item a item)."
+        "Marque as peças vendidas: elas vão para a sacola da venda (logo abaixo) e continuam lá "
+        "quando você pesquisa outra peça. O preço vem pré-preenchido com o preço de venda, "
+        "mas pode ser ajustado (ex: negociação item a item)."
     )
 
     if df_estoque.empty:
         st.warning("Nenhuma peça em estoque bate com essa busca.")
-        return
-
-    editado = st.data_editor(
-        df_estoque,
-        use_container_width=True,
-        hide_index=True,
-        disabled=["id", "descricao", "marca", "tipo_peca", "tamanho", "preco_venda"],
-        key=f"editor_venda_{st.session_state.venda_version}_{busca}",
-        column_config={
-            "vender": st.column_config.CheckboxColumn("Vender?"),
-            "marca": st.column_config.TextColumn("Marca"),
-            "preco_vendido": st.column_config.NumberColumn(
-                "Preço vendido (R$)", min_value=0.0, step=1.0
+    else:
+        editado = st.data_editor(
+            df_estoque,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["id", "descricao", "marca", "tipo_peca", "tamanho", "preco_venda"],
+            key=(
+                f"editor_venda_{st.session_state.venda_version}_{versao_sacola}_"
+                f"{st.session_state['venda_busca_n']}"
             ),
-        },
-    )
+            column_config={
+                "vender": st.column_config.CheckboxColumn("Vender?"),
+                "marca": st.column_config.TextColumn("Marca"),
+                "preco_vendido": st.column_config.NumberColumn(
+                    "Preço vendido (R$)", min_value=0.0, step=1.0
+                ),
+            },
+        )
+        # atualiza a sacola só com as peças que estão na tela; as outras ficam como estão
+        for _, linha in editado.iterrows():
+            pid = int(linha["id"])
+            if bool(linha["vender"]):
+                sacola[pid] = _preco(linha["preco_vendido"], linha["preco_venda"])
+            else:
+                sacola.pop(pid, None)
 
-    selecionados = editado[editado["vender"]]
+    # ---- a sacola ----
+    if sacola:
+        st.subheader(f"Sacola desta venda — {len(sacola)} peça(s)")
+        conteudo = tuple(sorted(sacola.items()))
+        tabela_sacola = st.data_editor(
+            pd.DataFrame(
+                [
+                    {
+                        "manter": True,
+                        "id": pid,
+                        "descricao": produto_por_id[pid]["descricao"],
+                        "marca": produto_por_id[pid]["marca"] or "",
+                        "tamanho": produto_por_id[pid]["tamanho"] or "",
+                        "preco_vendido": preco,
+                    }
+                    for pid, preco in sacola.items()
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=["id", "descricao", "marca", "tamanho"],
+            key=f"sacola_{st.session_state.venda_version}_{hash(conteudo)}",
+            column_config={
+                "manter": st.column_config.CheckboxColumn("Na sacola?", help="Desmarque para tirar a peça da venda."),
+                "id": st.column_config.NumberColumn("Código", format="%d"),
+                "descricao": st.column_config.TextColumn("Descrição"),
+                "marca": st.column_config.TextColumn("Marca"),
+                "tamanho": st.column_config.TextColumn("Tamanho"),
+                "preco_vendido": st.column_config.NumberColumn("Preço vendido (R$)", min_value=0.0, step=1.0),
+            },
+        )
+        nova_sacola = {
+            int(l["id"]): _preco(l["preco_vendido"], produto_por_id[int(l["id"])]["preco_venda"] or 0)
+            for _, l in tabela_sacola.iterrows()
+            if bool(l["manter"])
+        }
+        if st.button("Esvaziar sacola", key=f"venda_esvaziar_{st.session_state.venda_version}"):
+            nova_sacola = {}
+        if nova_sacola != sacola:
+            # mudou pela sacola: refaz a tela para a tabela de cima mostrar o mesmo
+            st.session_state["venda_sacola"] = nova_sacola
+            st.session_state["venda_sacola_versao"] = versao_sacola + 1
+            st.rerun()
+
+    selecionados = pd.DataFrame(
+        [{"id": pid, "preco_vendido": preco} for pid, preco in sacola.items()],
+        columns=["id", "preco_vendido"],
+    )
 
     col1, col2 = st.columns(2)
     cliente = col1.text_input("Cliente (opcional)")
@@ -171,6 +258,7 @@ def _aba_registrar_venda():
             f"total {brl(valor_total)} (desconto de {brl(desconto)})."
         )
         st.session_state.venda_version += 1
+        st.session_state["venda_sacola"] = {}
         st.rerun()
 
 

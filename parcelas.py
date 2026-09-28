@@ -12,7 +12,7 @@ from decimal import ROUND_DOWN, Decimal
 import pandas as pd
 import streamlit as st
 
-from formatacao import brl
+from formatacao import brl, hoje_brasil
 
 MAX_PARCELAS = 24
 
@@ -23,6 +23,15 @@ INTERVALOS = {
     "A cada 7 dias": ("dias", 7),
 }
 INTERVALO_PADRAO = "Mensal (mesmo dia do mês)"
+
+# código gravado no banco (avaliação) <-> texto da tela
+INTERVALO_POR_CODIGO = {
+    "mensal": "Mensal (mesmo dia do mês)",
+    "30d": "A cada 30 dias",
+    "15d": "A cada 15 dias",
+    "7d": "A cada 7 dias",
+}
+CODIGO_POR_INTERVALO = {v: k for k, v in INTERVALO_POR_CODIGO.items()}
 
 CENTAVO = Decimal("0.01")
 
@@ -99,7 +108,8 @@ def _para_data(valor):
 
 
 def editor_parcelas(total, data_minima, chave, quantidade_padrao=1, vencimento_padrao=None,
-                    iniciais=None, rotulo_quantidade="Número de parcelas"):
+                    iniciais=None, rotulo_quantidade="Número de parcelas",
+                    intervalo_padrao=INTERVALO_PADRAO):
     """Bloco de tela do parcelamento.
 
     total: valor a parcelar; data_minima: nenhum vencimento pode ser antes dela;
@@ -112,7 +122,7 @@ def editor_parcelas(total, data_minima, chave, quantidade_padrao=1, vencimento_p
     """
     total = dec(total)
     if vencimento_padrao is None:
-        vencimento_padrao = max(data_minima, date.today()) + timedelta(days=30)
+        vencimento_padrao = max(data_minima, hoje_brasil()) + timedelta(days=30)
 
     col1, col2, col3 = st.columns(3)
     quantidade = int(
@@ -127,14 +137,14 @@ def editor_parcelas(total, data_minima, chave, quantidade_padrao=1, vencimento_p
     )
     intervalo = col3.selectbox(
         "Intervalo entre parcelas", list(INTERVALOS), key=f"{chave}_intervalo",
-        disabled=quantidade == 1,
+        index=list(INTERVALOS).index(intervalo_padrao), disabled=quantidade == 1,
     )
 
     usar_iniciais = (
         iniciais
         and quantidade == int(quantidade_padrao)
         and primeiro == vencimento_padrao
-        and intervalo == INTERVALO_PADRAO
+        and intervalo == intervalo_padrao
     )
     if usar_iniciais:
         sugeridas = [

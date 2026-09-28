@@ -8,7 +8,7 @@ from branding import aplicar_logo
 from auth import exigir_login, botao_logout
 from pdf_avaliacao import gerar_pdf_avaliacao
 from controle_pagamentos import renderizar_controle_pagamentos
-from formatacao import brl, fmt_data
+from formatacao import brl, fmt_data, hoje_brasil
 from parcelas import dec, editor_parcelas
 from compras_parcelas import (
     ParcelasAlteradasError,
@@ -17,12 +17,16 @@ from compras_parcelas import (
     reparcelar,
 )
 from prazos_proposta import (
-    PRAZO_CURTO_DIAS,
-    PRAZO_LONGO_DIAS_UTEIS,
-    ROTULO_CURTO,
-    ROTULO_LONGO,
-    vencimento_da_proposta,
+    PARCELADA_PRIMEIRA_DIAS_UTEIS_PADRAO,
+    PARCELADA_QTD_PADRAO,
+    PRAZO_A_VISTA_DIAS,
+    ROTULO_A_VISTA,
+    descricao_parcelada,
+    primeiro_vencimento_parcelada,
+    rotulo_parcelada,
+    vencimento_a_vista,
 )
+from parcelas import CODIGO_POR_INTERVALO, INTERVALO_POR_CODIGO
 
 st.set_page_config(page_title="Compras", page_icon="assets/icone_coracao.png", layout="wide")
 aplicar_logo()
@@ -50,8 +54,8 @@ def _limpar_itens_avaliacao(df, tipo_padrao):
     novas — sem isso, bool(NaN) vira True e derruba a lógica de aprovação."""
     limpo = df[df["descricao"].fillna("").str.strip() != ""].copy()
     limpo["aprovada"] = limpo["aprovada"].fillna(False).astype(bool)
-    limpo["valor_curto"] = pd.to_numeric(limpo["valor_curto"], errors="coerce").fillna(0.0)
-    limpo["valor_longo"] = pd.to_numeric(limpo["valor_longo"], errors="coerce").fillna(0.0)
+    limpo["valor_a_vista"] = pd.to_numeric(limpo["valor_a_vista"], errors="coerce").fillna(0.0)
+    limpo["valor_parcelado"] = pd.to_numeric(limpo["valor_parcelado"], errors="coerce").fillna(0.0)
     limpo["tipo_peca"] = limpo["tipo_peca"].fillna(tipo_padrao)
     limpo["tamanho"] = limpo["tamanho"].fillna("")
     limpo["marca"] = limpo["marca"].fillna("")
@@ -66,26 +70,32 @@ def _marca_limpa(valor):
     return " ".join(str(valor).split()) or None
 
 
-def _aprovadas_sem_valor(itens_df):
-    """Peças aprovadas precisam ter valor nas duas propostas."""
+def _aprovadas_sem_valor(itens_df, config):
+    """Peças aprovadas precisam ter valor em cada proposta que vai ser enviada."""
     aprovadas = itens_df[itens_df["aprovada"]]
-    return int(((aprovadas["valor_curto"] <= 0) | (aprovadas["valor_longo"] <= 0)).sum())
+    faltando = pd.Series(False, index=aprovadas.index)
+    if config["envia_a_vista"]:
+        faltando |= aprovadas["valor_a_vista"] <= 0
+    if config["envia_parcelada"]:
+        faltando |= aprovadas["valor_parcelado"] <= 0
+    return int(faltando.sum())
 
 
-def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome):
+def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome, config):
     """Apaga os itens atuais da avaliação e grava os do dataframe editado
-    (dentro da transação recebida). Retorna a lista pronta pra gerar o PDF."""
+    (dentro da transação recebida). O valor de uma proposta que não vai ser
+    enviada não é gravado. Retorna a lista pronta pra gerar o PDF."""
     executar("DELETE FROM avaliacao_item WHERE avaliacao_id = %s", (avaliacao_id,))
     itens_para_pdf = []
     for _, item in itens_df.iterrows():
         aprovada = bool(item["aprovada"])
-        curto = float(item["valor_curto"]) if aprovada else None
-        longo = float(item["valor_longo"]) if aprovada else None
+        a_vista = float(item["valor_a_vista"]) if aprovada and config["envia_a_vista"] else None
+        parcelado = float(item["valor_parcelado"]) if aprovada and config["envia_parcelada"] else None
         executar(
             """
             INSERT INTO avaliacao_item
                 (avaliacao_id, descricao, marca, tipo_peca_id, tamanho, aprovada,
-                 valor_curto_prazo, valor_longo_prazo, observacao)
+                 valor_a_vista, valor_parcelado, observacao)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
@@ -95,8 +105,8 @@ def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome
                 tipo_peca_por_nome.get(item["tipo_peca"]),
                 item["tamanho"] or None,
                 aprovada,
-                curto,
-                longo,
+                a_vista,
+                parcelado,
                 item["observacao"] or None,
             ),
         )
@@ -107,8 +117,8 @@ def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome
                 "tipo_peca": item["tipo_peca"],
                 "tamanho": item["tamanho"],
                 "aprovada": aprovada,
-                "valor_curto_prazo": curto,
-                "valor_longo_prazo": longo,
+                "valor_a_vista": a_vista,
+                "valor_parcelado": parcelado,
                 "observacao": item["observacao"],
             }
         )
@@ -116,22 +126,96 @@ def _salvar_itens_avaliacao(executar, avaliacao_id, itens_df, tipo_peca_por_nome
 
 
 def _config_colunas_avaliacao():
+    # as duas colunas de valor ficam sempre na tabela: esconder uma delas faria o
+    # Streamlit apagar o que já foi digitado. A coluna da proposta que não vai
+    # ser enviada é simplesmente ignorada ao salvar.
     return {
         "descricao": st.column_config.TextColumn("Descrição"),
         "marca": st.column_config.TextColumn("Marca"),
         "tipo_peca": st.column_config.SelectboxColumn("Tipo de peça", options=nomes_tipo_peca),
         "tamanho": st.column_config.TextColumn("Tamanho"),
         "aprovada": st.column_config.CheckboxColumn("Aprovada?"),
-        "valor_curto": st.column_config.NumberColumn(
-            "Proposta A — curto prazo (R$)", min_value=0.0, step=1.0,
-            help=f"Valor se o pagamento for feito em até {PRAZO_CURTO_DIAS} dias. Só vale se a peça for aprovada.",
+        "valor_a_vista": st.column_config.NumberColumn(
+            "Valor à vista (R$)", min_value=0.0, step=1.0,
+            help=f"Valor da peça na proposta à vista (pagamento em até {PRAZO_A_VISTA_DIAS} dias). "
+                 "Deixe 0 se não for enviar a proposta à vista.",
         ),
-        "valor_longo": st.column_config.NumberColumn(
-            "Proposta B — longo prazo (R$)", min_value=0.0, step=1.0,
-            help=f"Valor se o pagamento for feito em até {PRAZO_LONGO_DIAS_UTEIS} dias úteis. Só vale se a peça for aprovada.",
+        "valor_parcelado": st.column_config.NumberColumn(
+            "Valor parcelado (R$)", min_value=0.0, step=1.0,
+            help="Valor total da peça na proposta parcelada (somando todas as parcelas). "
+                 "Deixe 0 se não for enviar a proposta parcelada.",
         ),
         "observacao": st.column_config.TextColumn("Observação"),
     }
+
+
+def _bloco_propostas(prefixo, atual=None):
+    """Escolha das propostas que vão para a fornecedora e das condições da
+    parcelada. Retorna (config, erro)."""
+    atual = atual or {
+        "envia_a_vista": True,
+        "envia_parcelada": True,
+        "parcelada_qtd": PARCELADA_QTD_PADRAO,
+        "parcelada_primeira_dias_uteis": PARCELADA_PRIMEIRA_DIAS_UTEIS_PADRAO,
+        "parcelada_intervalo": "mensal",
+    }
+    st.markdown("**Propostas a enviar** — marque uma ou as duas")
+    col_av, col_pa = st.columns(2)
+    envia_a_vista = col_av.checkbox(
+        f"Proposta à vista (pagamento em até {PRAZO_A_VISTA_DIAS} dias)",
+        value=atual["envia_a_vista"], key=f"{prefixo}_envia_av",
+    )
+    envia_parcelada = col_pa.checkbox("Proposta parcelada", value=atual["envia_parcelada"], key=f"{prefixo}_envia_pa")
+
+    config = {
+        "envia_a_vista": envia_a_vista,
+        "envia_parcelada": envia_parcelada,
+        "parcelada_qtd": atual["parcelada_qtd"],
+        "parcelada_primeira_dias_uteis": atual["parcelada_primeira_dias_uteis"],
+        "parcelada_intervalo": atual["parcelada_intervalo"],
+    }
+    if envia_parcelada:
+        c1, c2, c3 = st.columns(3)
+        config["parcelada_qtd"] = int(c1.number_input(
+            "Número de parcelas", min_value=1, max_value=24, step=1,
+            value=int(atual["parcelada_qtd"]), key=f"{prefixo}_qtd",
+        ))
+        config["parcelada_primeira_dias_uteis"] = int(c2.number_input(
+            "1ª parcela em (dias úteis após o aceite)", min_value=0, max_value=120, step=1,
+            value=int(atual["parcelada_primeira_dias_uteis"]), key=f"{prefixo}_dias",
+        ))
+        rotulos_intervalo = list(INTERVALO_POR_CODIGO.values())
+        escolhido = c3.selectbox(
+            "Intervalo entre parcelas", rotulos_intervalo,
+            index=rotulos_intervalo.index(INTERVALO_POR_CODIGO[atual["parcelada_intervalo"]]),
+            key=f"{prefixo}_intervalo", disabled=config["parcelada_qtd"] == 1,
+        )
+        config["parcelada_intervalo"] = CODIGO_POR_INTERVALO[escolhido]
+
+    erro = None if (envia_a_vista or envia_parcelada) else "Marque ao menos uma proposta para enviar."
+    return config, erro
+
+
+def _gravar_config_avaliacao(executar, avaliacao_id, config):
+    executar(
+        """
+        UPDATE avaliacao
+        SET envia_a_vista = %s, envia_parcelada = %s, parcelada_qtd = %s,
+            parcelada_primeira_dias_uteis = %s, parcelada_intervalo = %s
+        WHERE id = %s
+        """,
+        (config["envia_a_vista"], config["envia_parcelada"], config["parcelada_qtd"],
+         config["parcelada_primeira_dias_uteis"], config["parcelada_intervalo"], avaliacao_id),
+    )
+
+
+def _nomes_propostas(config):
+    nomes = []
+    if config["envia_a_vista"]:
+        nomes.append("à vista")
+    if config["envia_parcelada"]:
+        nomes.append(rotulo_parcelada(config).lower())
+    return " e ".join(nomes)
 
 
 aba_compra, aba_avaliacao, aba_pagamentos = st.tabs(
@@ -167,7 +251,8 @@ with aba_compra:
     # ---- propostas em aberto dessa fornecedora ----
     versao_compra = st.session_state.setdefault("compra_version", 0)
     avaliacao_selecionada_id = None
-    proposta_escolhida = None  # 'curto' ou 'longo' (só quando usa uma avaliação)
+    proposta_escolhida = None  # 'a_vista' ou 'parcelada' (só quando usa uma avaliação)
+    config_proposta = None     # condições da avaliação escolhida (parcelas etc.)
     itens_iniciais = pd.DataFrame(
         [
             {
@@ -185,9 +270,11 @@ with aba_compra:
         propostas_abertas = run_query(
             """
             SELECT a.id, a.data_avaliacao,
+                   a.envia_a_vista, a.envia_parcelada, a.parcelada_qtd,
+                   a.parcelada_primeira_dias_uteis, a.parcelada_intervalo,
                    COUNT(*) FILTER (WHERE ai.aprovada) AS aprovadas,
-                   COALESCE(SUM(ai.valor_curto_prazo) FILTER (WHERE ai.aprovada), 0) AS total_curto,
-                   COALESCE(SUM(ai.valor_longo_prazo) FILTER (WHERE ai.aprovada), 0) AS total_longo
+                   COALESCE(SUM(ai.valor_a_vista) FILTER (WHERE ai.aprovada), 0) AS total_a_vista,
+                   COALESCE(SUM(ai.valor_parcelado) FILTER (WHERE ai.aprovada), 0) AS total_parcelado
             FROM avaliacao a
             JOIN avaliacao_item ai ON ai.avaliacao_id = a.id
             WHERE a.fornecedora_id = %s AND a.status = 'pendente'
@@ -199,10 +286,16 @@ with aba_compra:
         )
         if propostas_abertas:
             opcoes_proposta = {"— nenhuma / compra manual —": None}
+            aval_por_id = {p["id"]: p for p in propostas_abertas}
             for p in propostas_abertas:
+                totais = []
+                if p["envia_a_vista"]:
+                    totais.append(f"à vista: {brl(p['total_a_vista'])}")
+                if p["envia_parcelada"]:
+                    totais.append(f"{rotulo_parcelada(p).lower()}: {brl(p['total_parcelado'])}")
                 rotulo = (
                     f"Avaliação #{p['id']} — {fmt_data(p['data_avaliacao'])} — "
-                    f"{p['aprovadas']} peça(s) — A: {brl(p['total_curto'])} · B: {brl(p['total_longo'])}"
+                    f"{p['aprovadas']} peça(s) — " + " · ".join(totais)
                 )
                 opcoes_proposta[rotulo] = p["id"]
             escolha_proposta = st.selectbox(
@@ -212,19 +305,27 @@ with aba_compra:
             avaliacao_selecionada_id = opcoes_proposta[escolha_proposta]
 
             if avaliacao_selecionada_id:
-                opcoes_prazo = {ROTULO_CURTO: "curto", ROTULO_LONGO: "longo"}
+                config_proposta = aval_por_id[avaliacao_selecionada_id]
+                opcoes_prazo = {}
+                if config_proposta["envia_a_vista"]:
+                    opcoes_prazo[ROTULO_A_VISTA] = "a_vista"
+                if config_proposta["envia_parcelada"]:
+                    opcoes_prazo[
+                        f"{rotulo_parcelada(config_proposta)} — "
+                        f"{descricao_parcelada(config_proposta['total_parcelado'], config_proposta)}"
+                    ] = "parcelada"
                 escolha_prazo = st.radio(
                     "Proposta aceita pela fornecedora",
                     options=list(opcoes_prazo.keys()),
                     key=f"proposta_aceita_{avaliacao_selecionada_id}",
-                    help="Só uma das duas propostas é fechada. Ela define o custo das peças e o vencimento.",
+                    help="Define o custo das peças e as parcelas sugeridas para o pagamento.",
                 )
                 proposta_escolhida = opcoes_prazo[escolha_prazo]
 
                 itens_aprovados = run_query(
                     """
                     SELECT ai.descricao, ai.marca, COALESCE(tp.nome, %s) AS tipo_peca, ai.tamanho,
-                           ai.valor_curto_prazo, ai.valor_longo_prazo
+                           ai.valor_a_vista, ai.valor_parcelado
                     FROM avaliacao_item ai
                     LEFT JOIN tipo_peca tp ON tp.id = ai.tipo_peca_id
                     WHERE ai.avaliacao_id = %s AND ai.aprovada = true
@@ -232,7 +333,7 @@ with aba_compra:
                     """,
                     (nomes_tipo_peca[0], avaliacao_selecionada_id),
                 )
-                coluna_valor = "valor_curto_prazo" if proposta_escolhida == "curto" else "valor_longo_prazo"
+                coluna_valor = "valor_a_vista" if proposta_escolhida == "a_vista" else "valor_parcelado"
                 itens_iniciais = pd.DataFrame(
                     [
                         {
@@ -251,11 +352,15 @@ with aba_compra:
                     "falta só definir o preço de venda de cada uma."
                 )
 
-    data_aceite = st.date_input("Data da compra", value=date.today(), format="DD/MM/YYYY")
+    data_aceite = st.date_input("Data da compra", value=hoje_brasil(), format="DD/MM/YYYY")
 
     # vencimento sugerido pela proposta ou pelo tipo de compra (vira o 1º vencimento)
-    if proposta_escolhida:
-        vencimento_sugerido = vencimento_da_proposta(proposta_escolhida, data_aceite)
+    if proposta_escolhida == "a_vista":
+        vencimento_sugerido = vencimento_a_vista(data_aceite)
+    elif proposta_escolhida == "parcelada":
+        vencimento_sugerido = primeiro_vencimento_parcelada(
+            data_aceite, config_proposta["parcelada_primeira_dias_uteis"]
+        )
     elif tipo_selecionado["prazo_dias"] > 0:
         vencimento_sugerido = data_aceite + timedelta(days=tipo_selecionado["prazo_dias"])
     else:
@@ -315,12 +420,18 @@ with aba_compra:
         )
         if modo_pagamento == A_PRAZO:
             if proposta_escolhida:
-                st.caption("1º vencimento sugerido pela proposta aceita; dá para mudar e parcelar.")
+                st.caption("Parcelas sugeridas pela proposta aceita; dá para ajustar antes de registrar.")
+            parcelada = proposta_escolhida == "parcelada"
             parcelas_compra, erro_parcelas = editor_parcelas(
                 valor_total,
                 data_aceite,
-                chave=f"compra_parc_{versao_compra}_{tipo_selecionado['id']}_{proposta_escolhida or ''}",
+                chave=f"compra_parc_{versao_compra}_{tipo_selecionado['id']}_{avaliacao_selecionada_id or ''}_{proposta_escolhida or ''}",
+                quantidade_padrao=config_proposta["parcelada_qtd"] if parcelada else 1,
                 vencimento_padrao=vencimento_sugerido or data_aceite + timedelta(days=30),
+                intervalo_padrao=(
+                    INTERVALO_POR_CODIGO[config_proposta["parcelada_intervalo"]] if parcelada
+                    else INTERVALO_POR_CODIGO["mensal"]
+                ),
             )
             if erro_parcelas:
                 st.error(erro_parcelas)
@@ -585,7 +696,9 @@ with aba_avaliacao:
             aval_id_edicao = st.session_state.editando_avaliacao_id
             aval_atual = run_query(
                 """
-                SELECT a.id, a.fornecedora_id, f.nome AS fornecedora, a.data_avaliacao, a.status
+                SELECT a.id, a.fornecedora_id, f.nome AS fornecedora, a.data_avaliacao, a.status,
+                       a.envia_a_vista, a.envia_parcelada, a.parcelada_qtd,
+                       a.parcelada_primeira_dias_uteis, a.parcelada_intervalo
                 FROM avaliacao a JOIN fornecedora f ON f.id = a.fornecedora_id
                 WHERE a.id = %s
                 """,
@@ -615,7 +728,7 @@ with aba_avaliacao:
             itens_atuais = run_query(
                 """
                 SELECT ai.descricao, ai.marca, COALESCE(tp.nome, %s) AS tipo_peca, ai.tamanho,
-                       ai.aprovada, ai.valor_curto_prazo, ai.valor_longo_prazo, ai.observacao
+                       ai.aprovada, ai.valor_a_vista, ai.valor_parcelado, ai.observacao
                 FROM avaliacao_item ai
                 LEFT JOIN tipo_peca tp ON tp.id = ai.tipo_peca_id
                 WHERE ai.avaliacao_id = %s
@@ -631,13 +744,17 @@ with aba_avaliacao:
                         "tipo_peca": i["tipo_peca"],
                         "tamanho": i["tamanho"] or "",
                         "aprovada": i["aprovada"],
-                        "valor_curto": float(i["valor_curto_prazo"]) if i["valor_curto_prazo"] is not None else 0.0,
-                        "valor_longo": float(i["valor_longo_prazo"]) if i["valor_longo_prazo"] is not None else 0.0,
+                        "valor_a_vista": float(i["valor_a_vista"]) if i["valor_a_vista"] is not None else 0.0,
+                        "valor_parcelado": float(i["valor_parcelado"]) if i["valor_parcelado"] is not None else 0.0,
                         "observacao": i["observacao"] or "",
                     }
                     for i in itens_atuais
                 ]
             )
+
+            config_edicao, erro_config_edicao = _bloco_propostas(f"prop_edicao_{aval_id_edicao}", aval_atual)
+            if erro_config_edicao:
+                st.error(erro_config_edicao)
 
             itens_editados = st.data_editor(
                 df_edicao,
@@ -647,31 +764,34 @@ with aba_avaliacao:
                 column_config=_config_colunas_avaliacao(),
             )
             itens_editados_limpos = _limpar_itens_avaliacao(itens_editados, nomes_tipo_peca[0])
-            sem_valor_edicao = _aprovadas_sem_valor(itens_editados_limpos)
-            if sem_valor_edicao:
+            sem_valor_edicao = _aprovadas_sem_valor(itens_editados_limpos, config_edicao)
+            if sem_valor_edicao and not erro_config_edicao:
                 st.warning(
-                    f"{sem_valor_edicao} peça(s) aprovada(s) sem valor em uma das propostas — "
-                    "preencha as duas para salvar."
+                    f"{sem_valor_edicao} peça(s) aprovada(s) sem valor na proposta {_nomes_propostas(config_edicao)} — "
+                    "preencha para salvar."
                 )
 
             col_salvar, col_cancelar = st.columns(2)
             if col_salvar.button(
                 "Salvar alterações",
                 type="primary",
-                disabled=itens_editados_limpos.empty or bool(sem_valor_edicao),
+                disabled=itens_editados_limpos.empty or bool(sem_valor_edicao) or bool(erro_config_edicao),
             ):
                 with transacao() as executar:
                     executar(
                         "UPDATE avaliacao SET fornecedora_id = %s, data_avaliacao = %s WHERE id = %s",
                         (opcoes_fornecedora_aval[nome_fornecedora_edicao], data_avaliacao_edicao, aval_id_edicao),
                     )
+                    _gravar_config_avaliacao(executar, aval_id_edicao, config_edicao)
                     itens_para_pdf = _salvar_itens_avaliacao(
-                        executar, aval_id_edicao, itens_editados_limpos, tipo_peca_por_nome
+                        executar, aval_id_edicao, itens_editados_limpos, tipo_peca_por_nome, config_edicao
                     )
                 st.success(f"Avaliação #{aval_id_edicao} atualizada.")
-                pdf_bytes = gerar_pdf_avaliacao(nome_fornecedora_edicao, data_avaliacao_edicao, itens_para_pdf)
+                pdf_bytes = gerar_pdf_avaliacao(
+                    nome_fornecedora_edicao, data_avaliacao_edicao, itens_para_pdf, config_edicao
+                )
                 st.download_button(
-                    "Baixar PDF atualizado (propostas A e B)",
+                    f"Baixar PDF atualizado (proposta {_nomes_propostas(config_edicao)})",
                     data=pdf_bytes,
                     file_name=f"proposta_avaliacao_{aval_id_edicao}.pdf",
                     mime="application/pdf",
@@ -691,10 +811,14 @@ with aba_avaliacao:
             nome_fornecedora_aval = st.selectbox(
                 "Fornecedora", options=list(opcoes_fornecedora_aval.keys()), key="fornecedora_aval_sel"
             )
-            data_avaliacao = st.date_input("Data da avaliação", value=date.today(), key="data_aval")
+            data_avaliacao = st.date_input("Data da avaliação", value=hoje_brasil(), key="data_aval")
 
             if "avaliacao_version" not in st.session_state:
                 st.session_state.avaliacao_version = 0
+
+            config_nova, erro_config_nova = _bloco_propostas(f"prop_nova_{st.session_state.avaliacao_version}")
+            if erro_config_nova:
+                st.error(erro_config_nova)
 
             itens_avaliacao = st.data_editor(
                 pd.DataFrame(
@@ -705,8 +829,8 @@ with aba_avaliacao:
                             "tipo_peca": nomes_tipo_peca[0],
                             "tamanho": "",
                             "aprovada": False,
-                            "valor_curto": 0.0,
-                            "valor_longo": 0.0,
+                            "valor_a_vista": 0.0,
+                            "valor_parcelado": 0.0,
                             "observacao": "",
                         }
                     ]
@@ -717,20 +841,23 @@ with aba_avaliacao:
                 column_config=_config_colunas_avaliacao(),
             )
             st.caption(
-                f"Cada peça aprovada recebe duas propostas: A — pagamento em até {PRAZO_CURTO_DIAS} dias "
-                f"e B — pagamento em até {PRAZO_LONGO_DIAS_UTEIS} dias úteis. O PDF leva as duas, "
-                "mas só uma será fechada."
+                "Preencha o valor de cada peça aprovada nas propostas marcadas acima (a coluna da "
+                "proposta que não vai ser enviada é ignorada). Se forem as duas, o PDF leva as duas "
+                "e só uma será fechada."
             )
 
             itens_aval_validos = _limpar_itens_avaliacao(itens_avaliacao, nomes_tipo_peca[0])
-            sem_valor = _aprovadas_sem_valor(itens_aval_validos)
-            if sem_valor:
+            sem_valor = _aprovadas_sem_valor(itens_aval_validos, config_nova)
+            if sem_valor and not erro_config_nova:
                 st.warning(
-                    f"{sem_valor} peça(s) aprovada(s) sem valor em uma das propostas — "
-                    "preencha as duas para salvar."
+                    f"{sem_valor} peça(s) aprovada(s) sem valor na proposta {_nomes_propostas(config_nova)} — "
+                    "preencha para salvar."
                 )
 
-            if st.button("Salvar avaliação", type="primary", disabled=itens_aval_validos.empty or bool(sem_valor)):
+            if st.button(
+                "Salvar avaliação", type="primary",
+                disabled=itens_aval_validos.empty or bool(sem_valor) or bool(erro_config_nova),
+            ):
                 fornecedora_aval_id = opcoes_fornecedora_aval[nome_fornecedora_aval]
 
                 with transacao() as executar:
@@ -740,15 +867,16 @@ with aba_avaliacao:
                         fetch=True,
                     )
                     avaliacao_id = avaliacao[0]["id"]
+                    _gravar_config_avaliacao(executar, avaliacao_id, config_nova)
                     itens_para_pdf = _salvar_itens_avaliacao(
-                        executar, avaliacao_id, itens_aval_validos, tipo_peca_por_nome
+                        executar, avaliacao_id, itens_aval_validos, tipo_peca_por_nome, config_nova
                     )
 
                 st.success(f"Avaliação #{avaliacao_id} salva com {len(itens_aval_validos)} peça(s).")
 
-                pdf_bytes = gerar_pdf_avaliacao(nome_fornecedora_aval, data_avaliacao, itens_para_pdf)
+                pdf_bytes = gerar_pdf_avaliacao(nome_fornecedora_aval, data_avaliacao, itens_para_pdf, config_nova)
                 st.download_button(
-                    "Baixar PDF das propostas (A e B)",
+                    f"Baixar PDF (proposta {_nomes_propostas(config_nova)})",
                     data=pdf_bytes,
                     file_name=f"proposta_avaliacao_{avaliacao_id}.pdf",
                     mime="application/pdf",
@@ -759,24 +887,43 @@ with aba_avaliacao:
 
         avaliacoes = run_query(
             """
-            SELECT a.id, f.nome AS fornecedora, a.data_avaliacao, a.status,
-                   CASE a.proposta_aceita WHEN 'curto' THEN 'A (curto prazo)'
-                                          WHEN 'longo' THEN 'B (longo prazo)' END AS proposta_aceita,
-                   COUNT(*) FILTER (WHERE ai.aprovada) AS aprovadas,
-                   COUNT(*) FILTER (WHERE NOT ai.aprovada) AS reprovadas,
-                   COALESCE(SUM(ai.valor_curto_prazo) FILTER (WHERE ai.aprovada), 0) AS total_proposta_a,
-                   COALESCE(SUM(ai.valor_longo_prazo) FILTER (WHERE ai.aprovada), 0) AS total_proposta_b
+            SELECT a.id, f.nome AS fornecedora, a.data_avaliacao, a.status, a.proposta_aceita,
+                   a.envia_a_vista, a.envia_parcelada, a.parcelada_qtd,
+                   a.parcelada_primeira_dias_uteis, a.parcelada_intervalo,
+                   COUNT(ai.id) FILTER (WHERE ai.aprovada) AS aprovadas,
+                   COUNT(ai.id) FILTER (WHERE NOT ai.aprovada) AS reprovadas,
+                   COALESCE(SUM(ai.valor_a_vista) FILTER (WHERE ai.aprovada), 0) AS total_a_vista,
+                   COALESCE(SUM(ai.valor_parcelado) FILTER (WHERE ai.aprovada), 0) AS total_parcelado
             FROM avaliacao a
             JOIN fornecedora f ON f.id = a.fornecedora_id
             LEFT JOIN avaliacao_item ai ON ai.avaliacao_id = a.id
-            GROUP BY a.id, f.nome, a.data_avaliacao, a.status, a.proposta_aceita
+            GROUP BY a.id, f.nome
             ORDER BY a.data_avaliacao DESC, a.id DESC
             LIMIT 30
             """
         )
 
         if avaliacoes:
-            st.dataframe(avaliacoes, use_container_width=True, hide_index=True)
+            nomes_aceita = {"a_vista": "À vista", "parcelada": "Parcelada"}
+            st.dataframe(
+                [
+                    {
+                        "Avaliação": f"#{a['id']}",
+                        "Fornecedora": a["fornecedora"],
+                        "Data": fmt_data(a["data_avaliacao"]),
+                        "Situação": a["status"],
+                        "Propostas enviadas": _nomes_propostas(a).capitalize(),
+                        "Aprovadas": a["aprovadas"],
+                        "Reprovadas": a["reprovadas"],
+                        "Total à vista": brl(a["total_a_vista"]) if a["envia_a_vista"] else "—",
+                        "Total parcelado": brl(a["total_parcelado"]) if a["envia_parcelada"] else "—",
+                        "Proposta aceita": nomes_aceita.get(a["proposta_aceita"], "—"),
+                    }
+                    for a in avaliacoes
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
             opcoes_aval = {
                 f"Avaliação #{a['id']} — {a['fornecedora']} — {a['data_avaliacao']} ({a['status']})": a
@@ -790,7 +937,7 @@ with aba_avaliacao:
                 itens_aval_download = run_query(
                     """
                     SELECT ai.descricao, ai.marca, tp.nome AS tipo_peca, ai.tamanho, ai.aprovada,
-                           ai.valor_curto_prazo, ai.valor_longo_prazo, ai.observacao
+                           ai.valor_a_vista, ai.valor_parcelado, ai.observacao
                     FROM avaliacao_item ai
                     LEFT JOIN tipo_peca tp ON tp.id = ai.tipo_peca_id
                     WHERE ai.avaliacao_id = %s
@@ -798,14 +945,12 @@ with aba_avaliacao:
                     """,
                     (aval_selecionada["id"],),
                 )
-                proposta_aceita_codigo = {"A (curto prazo)": "curto", "B (longo prazo)": "longo"}.get(
-                    aval_selecionada["proposta_aceita"]
-                )
                 pdf_bytes_download = gerar_pdf_avaliacao(
                     aval_selecionada["fornecedora"],
                     aval_selecionada["data_avaliacao"],
                     itens_aval_download,
-                    proposta_aceita_codigo,
+                    aval_selecionada,
+                    aval_selecionada["proposta_aceita"],
                 )
                 st.download_button(
                     "Baixar PDF",

@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from db import run_query
+from formatacao import hoje_brasil
 from branding import aplicar_logo
 from auth import exigir_login, botao_logout
 
@@ -14,7 +15,7 @@ exigir_login()
 botao_logout()
 st.title("Relatório financeiro")
 
-hoje = date.today()
+hoje = hoje_brasil()
 col1, col2 = st.columns(2)
 data_inicio = col1.date_input("De", value=hoje.replace(day=1))
 data_fim = col2.date_input("Até", value=hoje)
