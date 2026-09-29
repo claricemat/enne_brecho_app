@@ -6,6 +6,7 @@ import streamlit as st
 
 from db import run_query
 from formatacao import hoje_brasil
+from controle_vendas import vendas_fiado_em_aberto
 from branding import aplicar_logo
 from auth import exigir_login, botao_logout
 
@@ -138,7 +139,8 @@ despesas_pendentes = run_query(
     "SELECT COUNT(*) AS qtd, COALESCE(SUM(valor), 0) AS total FROM despesa WHERE status_pagamento = 'pendente'"
 )[0]
 
-col1, col2 = st.columns(2)
+em_fiado = vendas_fiado_em_aberto()
+col1, col2, col3 = st.columns(3)
 col1.metric(
     "A pagar a fornecedoras",
     f"R$ {float(compras_pendentes['total']):.2f}",
@@ -148,6 +150,13 @@ col2.metric(
     "Despesas pendentes",
     f"R$ {float(despesas_pendentes['total']):.2f}",
     f"{despesas_pendentes['qtd']} lançamento(s)",
+)
+col3.metric(
+    "A receber (cliente fiel)",
+    f"R$ {float(sum(v['saldo'] for v in em_fiado)):.2f}",
+    f"{len(em_fiado)} venda(s) fiado",
+    delta_color="off",
+    help="Vendas em Cliente fiel (fiado) que ainda não foram pagas. Controle na página Vendas.",
 )
 
 # ------------------------------------------------------------
@@ -307,7 +316,10 @@ st.subheader("Exportar")
 
 vendas_detalhe = run_query(
     """
-    SELECT v.id, v.data_venda, v.cliente, v.forma_pagamento, v.desconto, v.valor_total,
+    SELECT v.id, v.data_venda, v.cliente, v.forma_pagamento,
+           CASE v.canal WHEN 'online' THEN 'Online' ELSE 'Loja' END AS canal,
+           CASE WHEN v.canal = 'online' THEN CASE WHEN v.entregue THEN 'Entregue' ELSE 'Não entregue' END END AS entrega,
+           v.desconto, v.valor_total,
            COALESCE(pc.nome, 'Sem classificação') AS tipo_receita
     FROM venda v
     LEFT JOIN plano_contas pc ON pc.id = v.plano_conta_id

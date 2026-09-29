@@ -137,6 +137,22 @@ def _carregar(inicio, fim):
             fetch=True,
         )
 
+        # loja × online: quantidade de vendas e valor (devoluções descontadas pelo canal da venda)
+        canais = q(
+            """
+            SELECT canal, SUM(conta) AS qtd, SUM(valor) AS valor FROM (
+                SELECT v.canal, 1 AS conta, v.valor_total AS valor FROM venda v
+                WHERE v.data_venda::date BETWEEN %s AND %s
+                UNION ALL
+                SELECT v.canal, 0, -d.valor_devolvido FROM devolucao d
+                JOIN venda v ON v.id = d.venda_id
+                WHERE d.data BETWEEN %s AND %s
+            ) x GROUP BY canal
+            """,
+            (inicio, fim, inicio, fim),
+            fetch=True,
+        )
+
         tipos = q(
             """
             SELECT COALESCE(tp.nome, 'Sem tipo') AS nome, COUNT(*) AS qtd
@@ -176,6 +192,7 @@ def _carregar(inicio, fim):
         "serie_despesas": serie_despesas,
         "serie_fornecedoras": serie_fornecedoras,
         "serie_vendas": serie_vendas,
+        "canais": canais,
         "tipos": tipos,
         "tamanhos": tamanhos,
     }
@@ -266,6 +283,39 @@ def _agrupar_top(linhas, limite, rotulo_demais):
     if resto:
         principais.append((rotulo_demais, resto))
     return principais
+
+
+def _grafico_loja_online(dados):
+    por_canal = {c["canal"]: c for c in dados["canais"]}
+    if not any((por_canal.get(k) or {}).get("qtd") for k in ("loja", "online")):
+        st.info("Sem vendas nesse período.")
+        return
+    linhas = []
+    for codigo, nome in (("loja", "Loja"), ("online", "Online")):
+        c = por_canal.get(codigo) or {"qtd": 0, "valor": 0}
+        linhas.append({"canal": nome, "qtd": int(c["qtd"] or 0), "valor": float(c["valor"] or 0),
+                       "valor_txt": brl(c["valor"] or 0)})
+    df = pd.DataFrame(linhas)
+    cores = alt.Scale(domain=["Loja", "Online"], range=[ROSA, VINHO])
+
+    def barras(campo, titulo, rotulo, formato_eixo):
+        base = alt.Chart(df).encode(
+            x=alt.X("canal:N", title=None, sort=["Loja", "Online"], axis=alt.Axis(labelAngle=0)),
+            y=alt.Y(f"{campo}:Q", title=titulo, axis=alt.Axis(format=formato_eixo)),
+            color=alt.Color("canal:N", scale=cores, legend=None),
+            tooltip=[alt.Tooltip("canal:N", title="Canal"), alt.Tooltip("qtd:Q", title="Vendas"),
+                     alt.Tooltip("valor_txt:N", title="Valor")],
+        )
+        return (base.mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3, size=60)
+                + base.mark_text(dy=-8, color="#2B2320").encode(text=rotulo)).properties(height=260)
+
+    col_qtd, col_valor = st.columns(2)
+    with col_qtd:
+        st.caption("Quantidade de vendas")
+        st.altair_chart(barras("qtd", "Vendas", "qtd:Q", "d"), use_container_width=True)
+    with col_valor:
+        st.caption("Valor total (líquido de devoluções)")
+        st.altair_chart(barras("valor", "R$", "valor_txt:N", "~s"), use_container_width=True)
 
 
 def _grafico_pizza_tipos(dados):
@@ -398,6 +448,9 @@ def renderizar_painel():
 
     st.subheader("Vendas por dia (líquidas de devoluções)")
     _grafico_vendas_por_dia(dados, inicio, fim)
+
+    st.subheader("Vendas na loja × online")
+    _grafico_loja_online(dados)
 
     col_pizza, col_barras = st.columns(2)
     with col_pizza:

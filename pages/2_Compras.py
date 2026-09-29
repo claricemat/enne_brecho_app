@@ -11,6 +11,11 @@ from controle_pagamentos import renderizar_controle_pagamentos
 from formatacao import brl, fmt_data, hoje_brasil
 from parcelas import dec, editor_parcelas
 from compras_parcelas import (
+    CompraNaoPodeSerExcluidaError,
+    analisar_exclusao,
+    compras_para_excluir,
+    excluir_avaliacao,
+    excluir_ou_desfazer_compra,
     ParcelasAlteradasError,
     compras_em_aberto,
     parcelas_da_compra,
@@ -671,6 +676,73 @@ with aba_compra:
                 st.session_state["reparc_versao"] = versao_reparc + 1
                 st.rerun()
 
+    # ---- excluir compra (bazar/outros) ou desfazer compra de fornecedora ----
+    st.divider()
+    st.subheader("Excluir ou desfazer compra")
+    st.caption(
+        "Compra de fornecedora que veio de uma avaliação é desfeita: a avaliação volta para "
+        "pendente na aba Avaliação de peças. Nos outros casos (bazar, outros...) a compra é excluída. "
+        "Nos dois casos as peças da compra saem do estoque."
+    )
+    mensagem_exclusao = st.session_state.pop("exclusao_sucesso", None)
+    if mensagem_exclusao:
+        st.success(mensagem_exclusao)
+    candidatas = compras_para_excluir()
+    if not candidatas:
+        st.info("Nenhuma compra registrada.")
+    else:
+        versao_exclusao = st.session_state.setdefault("exclusao_versao", 0)
+        opcoes_exclusao = {
+            f"Compra #{c['id']} — {c['tipo_compra']} — {c['fornecedora']} — {fmt_data(c['data_aceite'])} — "
+            f"{brl(c['valor_total'])}" + (f" — da avaliação #{c['avaliacao_id']}" if c["avaliacao_id"] else ""): c
+            for c in candidatas
+        }
+        escolha_exclusao = st.selectbox(
+            "Compra", list(opcoes_exclusao), index=None, placeholder="Escolha a compra",
+            key=f"exclusao_sel_{versao_exclusao}",
+        )
+        if escolha_exclusao:
+            alvo_exclusao = opcoes_exclusao[escolha_exclusao]
+            analise = analisar_exclusao(alvo_exclusao["id"])
+            desfazer = analise["avaliacao_id"] is not None
+            if analise["impedimentos"]:
+                for motivo in analise["impedimentos"]:
+                    st.warning(motivo)
+            elif desfazer:
+                st.info(
+                    f"Ao desfazer: a avaliação #{analise['avaliacao_id']} volta para **pendente** (dá para "
+                    f"editar, aceitar de novo ou excluir), as {analise['pecas']} peça(s) saem do estoque "
+                    "e a compra e as parcelas dela são apagadas."
+                )
+            else:
+                st.info(
+                    f"Ao excluir: as {analise['pecas']} peça(s) saem do estoque e a compra e as parcelas "
+                    "dela são apagadas. Isso não pode ser desfeito."
+                )
+            acao = "Desfazer compra" if desfazer else "Excluir compra"
+            confirmado = st.checkbox(
+                f"Confirmo: {acao.lower()} #{alvo_exclusao['id']}",
+                key=f"exclusao_ok_{versao_exclusao}_{alvo_exclusao['id']}",
+                disabled=bool(analise["impedimentos"]),
+            )
+            if st.button(
+                acao, type="primary", key=f"exclusao_btn_{versao_exclusao}",
+                disabled=bool(analise["impedimentos"]) or not confirmado,
+            ):
+                try:
+                    reaberta = excluir_ou_desfazer_compra(alvo_exclusao["id"])
+                except CompraNaoPodeSerExcluidaError as e:
+                    st.error(str(e))
+                else:
+                    st.session_state["exclusao_sucesso"] = (
+                        f"Compra #{alvo_exclusao['id']} desfeita: a avaliação #{reaberta} voltou para pendente "
+                        "na aba Avaliação de peças."
+                        if reaberta else f"Compra #{alvo_exclusao['id']} excluída."
+                    )
+                    st.session_state["exclusao_versao"] = versao_exclusao + 1
+                    st.rerun()
+
+
 # ================================================================
 # Aba: Avaliação de Peças
 # ================================================================
@@ -974,6 +1046,36 @@ with aba_avaliacao:
                         )
                         st.success("Avaliação marcada como recusada.")
                         st.rerun()
+
+            # ---- excluir avaliação (pendente ou recusada) ----
+            mensagem_aval_excluida = st.session_state.pop("aval_excluida", None)
+            if mensagem_aval_excluida:
+                st.success(mensagem_aval_excluida)
+            if aval_selecionada["status"] in ("pendente", "recusada"):
+                with st.expander(f"Excluir a avaliação #{aval_selecionada['id']}"):
+                    st.caption("A avaliação e as peças dela são apagadas. Isso não pode ser desfeito.")
+                    confirma_aval = st.checkbox(
+                        f"Confirmo: excluir a avaliação #{aval_selecionada['id']}",
+                        key=f"excluir_aval_ok_{aval_selecionada['id']}",
+                    )
+                    if st.button(
+                        "Excluir avaliação", disabled=not confirma_aval,
+                        key=f"excluir_aval_{aval_selecionada['id']}",
+                    ):
+                        if excluir_avaliacao(aval_selecionada["id"]):
+                            if st.session_state.get("editando_avaliacao_id") == aval_selecionada["id"]:
+                                st.session_state.editando_avaliacao_id = None
+                            st.session_state["aval_excluida"] = f"Avaliação #{aval_selecionada['id']} excluída."
+                        else:
+                            st.session_state["aval_excluida"] = (
+                                "A avaliação não pôde ser excluída (talvez tenha sido aceita nesse meio-tempo)."
+                            )
+                        st.rerun()
+            elif aval_selecionada["status"] == "aceita":
+                st.caption(
+                    "Avaliação aceita não pode ser excluída. Para isso, desfaça a compra dela na aba "
+                    "Registrar compra (seção Excluir ou desfazer compra); ela volta a ficar pendente."
+                )
         else:
             st.info("Nenhuma avaliação registrada ainda.")
 

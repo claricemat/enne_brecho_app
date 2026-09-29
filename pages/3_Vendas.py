@@ -7,6 +7,23 @@ import streamlit as st
 from db import run_query, transacao
 from branding import aplicar_logo
 from auth import exigir_login, botao_logout
+from controle_vendas import (
+    FORMA_FIADO,
+    FORMAS_RECEBIMENTO,
+    RecebimentoInvalidoError,
+    chave_cliente,
+    clientes_fiel,
+    desfazer_entrega,
+    distribuir_pagamento,
+    excluir_recebimento,
+    marcar_entregues,
+    recebido_no_periodo,
+    recebimentos_recentes,
+    registrar_recebimento,
+    resumo_por_cliente,
+    vendas_fiado_em_aberto,
+    vendas_online,
+)
 from devolucoes import (
     FORMAS_REEMBOLSO,
     DevolucaoInvalidaError,
@@ -31,7 +48,9 @@ if "venda_version" not in st.session_state:
 
 mensagem_venda = st.session_state.pop("venda_sucesso", None)
 
-aba_venda, aba_devolucao = st.tabs(["Registrar venda", "Devolução de peças"])
+aba_venda, aba_fiado, aba_entregas, aba_devolucao = st.tabs(
+    ["Registrar venda", "Cliente fiel (fiado)", "Entregas online", "Devolução de peças"]
+)
 
 
 def _aba_registrar_venda():
@@ -185,12 +204,40 @@ def _aba_registrar_venda():
         columns=["id", "preco_vendido"],
     )
 
+    v = st.session_state.venda_version
     col1, col2 = st.columns(2)
-    cliente = col1.text_input("Cliente (opcional)")
-    forma_pagamento = col2.selectbox(
+    forma_pagamento = col1.selectbox(
         "Forma de pagamento",
-        ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Crédito Loja", "Outro"],
+        ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Crédito Loja", FORMA_FIADO, "Outro"],
+        key=f"venda_forma_{v}",
+        help=f"\"{FORMA_FIADO}\" é a venda fiado: a cliente paga depois. "
+             "Acompanhe e registre os pagamentos na aba Cliente fiel (fiado).",
     )
+    canal_rotulo = col2.radio("Onde foi a venda", ["Na loja", "Online"], horizontal=True, key=f"venda_canal_{v}")
+    canal = "online" if canal_rotulo == "Online" else "loja"
+    entregue = None
+    if canal == "online":
+        entregue = col2.checkbox(
+            "Já foi entregue", value=False, key=f"venda_entregue_{v}",
+            help="Se ainda não foi, a venda fica na aba Entregas online até ser marcada como entregue.",
+        )
+
+    fiado = forma_pagamento == FORMA_FIADO
+    if fiado:
+        NOVA_CLIENTE = "+ Nova cliente…"
+        conhecidas = clientes_fiel()
+        escolha_cliente = st.selectbox(
+            "Cliente (obrigatório no fiado)", conhecidas + [NOVA_CLIENTE],
+            index=None if conhecidas else 0, placeholder="Escolha a cliente",
+            key=f"venda_cliente_fiel_{v}",
+        )
+        if escolha_cliente == NOVA_CLIENTE:
+            cliente = st.text_input("Nome da nova cliente", key=f"venda_cliente_nova_{v}")
+        else:
+            cliente = escolha_cliente or ""
+    else:
+        cliente = st.text_input("Cliente (opcional)", key=f"venda_cliente_{v}")
+    cliente = " ".join(str(cliente or "").split())
 
     tipos_receita = run_query("SELECT id, nome FROM plano_contas WHERE tipo = 'receita' ORDER BY nome")
     opcoes_receita = {r["nome"]: r["id"] for r in tipos_receita} if tipos_receita else {}
@@ -210,7 +257,9 @@ def _aba_registrar_venda():
         valor_total_preview = max(subtotal - desconto, 0)
         st.metric("Total da venda", brl(valor_total_preview), f"desconto {brl(desconto)}")
 
-    if st.button("Registrar venda", type="primary", disabled=selecionados.empty):
+    if fiado and not cliente:
+        st.info("Informe a cliente para registrar uma venda em Cliente fiel.")
+    if st.button("Registrar venda", type="primary", disabled=selecionados.empty or (fiado and not cliente)):
         subtotal = round(selecionados["preco_vendido"].sum(), 2)
         valor_total = round(max(subtotal - desconto, 0), 2)
 
@@ -218,9 +267,11 @@ def _aba_registrar_venda():
             # tudo numa transação: ou a venda inteira é gravada, ou nada
             with transacao() as executar:
                 venda_id = executar(
-                    "INSERT INTO venda (forma_pagamento, valor_total, cliente, desconto, plano_conta_id) "
-                    "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                    (forma_pagamento, valor_total, cliente.strip() or None, desconto, plano_conta_id),
+                    "INSERT INTO venda (forma_pagamento, valor_total, cliente, desconto, plano_conta_id, "
+                    "canal, entregue, data_entrega) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (forma_pagamento, valor_total, cliente or None, desconto, plano_conta_id,
+                     canal, entregue, hoje_brasil() if entregue else None),
                     fetch=True,
                 )[0]["id"]
 
@@ -253,9 +304,15 @@ def _aba_registrar_venda():
             st.error(f"Não foi possível registrar a venda. Nada foi gravado. Erro: {e}")
             return
 
+        extras = []
+        if canal == "online":
+            extras.append("online, já entregue" if entregue else "online, aguardando entrega")
+        if fiado:
+            extras.append(f"fiado para {cliente}")
         st.session_state["venda_sucesso"] = (
             f"Venda #{venda_id} registrada — {len(selecionados)} peça(s), "
-            f"total {brl(valor_total)} (desconto de {brl(desconto)})."
+            f"total {brl(valor_total)} (desconto de {brl(desconto)})"
+            + (f" — {'; '.join(extras)}." if extras else ".")
         )
         st.session_state.venda_version += 1
         st.session_state["venda_sacola"] = {}
@@ -268,6 +325,7 @@ def _vendas_recentes():
     vendas = run_query(
         """
         SELECT v.id, v.data_venda, v.cliente, v.forma_pagamento, v.desconto, v.valor_total,
+               v.canal, v.entregue,
                COALESCE((SELECT SUM(d.valor_devolvido) FROM devolucao d WHERE d.venda_id = v.id), 0) AS devolvido,
                pc.nome AS tipo_receita
         FROM venda v
@@ -283,6 +341,8 @@ def _vendas_recentes():
                     "Data": fmt_data(v["data_venda"]),
                     "Cliente": v["cliente"] or "",
                     "Forma de pagamento": v["forma_pagamento"] or "",
+                    "Canal": "Online" if v["canal"] == "online" else "Loja",
+                    "Entrega": ("Entregue" if v["entregue"] else "Não entregue") if v["canal"] == "online" else "—",
                     "Desconto": brl(v["desconto"]),
                     "Valor total": brl(v["valor_total"]),
                     "Devolvido": brl(v["devolvido"]) if v["devolvido"] else "—",
@@ -502,11 +562,227 @@ def _devolucoes_recentes():
                     st.rerun()
 
 
+def _aba_fiado():
+    st.caption(
+        f"Vendas com a forma de pagamento \"{FORMA_FIADO}\". Quando a cliente pagar (tudo ou uma parte), "
+        "registre aqui: o valor abate primeiro as compras mais antigas dela."
+    )
+    mensagem = st.session_state.pop("fiado_sucesso", None)
+    if mensagem:
+        st.success(mensagem)
+    versao = st.session_state.setdefault("fiado_versao", 0)
+    hoje = hoje_brasil()
+
+    em_aberto = vendas_fiado_em_aberto()
+    por_cliente = resumo_por_cliente(em_aberto)
+    total = sum((v["saldo"] for v in em_aberto), dec(0))
+    c1, c2, c3 = st.columns(3)
+    with c1.container(border=True):
+        st.metric("Total a receber", brl(total))
+    with c2.container(border=True):
+        st.metric("Clientes devendo", len(por_cliente), help=f"{len(em_aberto)} venda(s) em aberto")
+    with c3.container(border=True):
+        st.metric("Recebido este mês", brl(recebido_no_periodo(hoje.replace(day=1), hoje)))
+
+    if not em_aberto:
+        st.success("Nenhuma venda fiado em aberto.")
+    else:
+        st.subheader("Quem está devendo")
+        st.dataframe(
+            [
+                {
+                    "Cliente": g["cliente"],
+                    "Vendas em aberto": g["vendas"],
+                    "Deve": brl(g["saldo"]),
+                    "Compra mais antiga": fmt_data(g["mais_antiga"]),
+                    "Dias em aberto": (hoje - g["mais_antiga"]).days,
+                }
+                for g in por_cliente
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Registrar pagamento")
+        opcoes = {f"{g['cliente']} — deve {brl(g['saldo'])}": g for g in por_cliente}
+        escolha = st.selectbox("Cliente", list(opcoes), key=f"fiado_cliente_{versao}")
+        g = opcoes[escolha]
+        vendas_cliente = [v for v in em_aberto if chave_cliente(v["cliente"]) == chave_cliente(g["cliente"])]
+        col1, col2, col3 = st.columns(3)
+        valor = col1.number_input(
+            "Valor pago (R$)", min_value=0.0, max_value=float(g["saldo"]), value=float(g["saldo"]),
+            step=1.0, format="%.2f", key=f"fiado_valor_{versao}_{escolha}",
+        )
+        data_pagto = col2.date_input("Data do pagamento", value=hoje, max_value=hoje, format="DD/MM/YYYY",
+                                     key=f"fiado_data_{versao}")
+        forma = col3.selectbox("Forma", FORMAS_RECEBIMENTO, key=f"fiado_forma_{versao}")
+        obs = st.text_input("Observação (opcional)", key=f"fiado_obs_{versao}")
+
+        partes = distribuir_pagamento(vendas_cliente, valor) if valor > 0 else []
+        saldo_por_venda = {v["id"]: v["saldo"] for v in vendas_cliente}
+        abatido = dict(partes)
+        st.dataframe(
+            [
+                {
+                    "Venda": f"#{v['id']}",
+                    "Data": fmt_data(v["data"]),
+                    "Valor da venda": brl(v["valor_total"]),
+                    "Já pago / devolvido": brl(dec(v["recebido"]) + dec(v["devolvido"])),
+                    "Devia": brl(saldo_por_venda[v["id"]]),
+                    "Este pagamento": brl(abatido.get(v["id"], 0)) if abatido.get(v["id"]) else "—",
+                    "Fica devendo": brl(saldo_por_venda[v["id"]] - abatido.get(v["id"], dec(0))),
+                }
+                for v in vendas_cliente
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        if st.button("Registrar pagamento", type="primary", disabled=valor <= 0, key=f"fiado_registrar_{versao}"):
+            try:
+                feitas = registrar_recebimento(
+                    g["cliente"], valor, data_pagto, forma, obs.strip(), st.session_state.get("usuario")
+                )
+            except RecebimentoInvalidoError as e:
+                st.error(str(e))
+            else:
+                restante = g["saldo"] - dec(valor)
+                st.session_state["fiado_sucesso"] = (
+                    f"Pagamento de {brl(valor)} de {g['cliente']} registrado "
+                    f"(vendas {', '.join('#' + str(vid) for vid, _ in feitas)}). "
+                    + (f"Ainda deve {brl(restante)}." if restante > 0 else "Tudo quitado!")
+                )
+                st.session_state["fiado_versao"] = versao + 1
+                st.rerun()
+
+    recentes = recebimentos_recentes()
+    if recentes:
+        st.divider()
+        st.subheader("Pagamentos recebidos")
+        st.dataframe(
+            [
+                {
+                    "Data": fmt_data(r["data"]),
+                    "Cliente": r["cliente"],
+                    "Valor": brl(r["valor"]),
+                    "Forma": r["forma"],
+                    "Vendas": r["vendas"],
+                    "Observação": r["observacao"] or "",
+                    "Registrado por": r["criado_por"] or "",
+                }
+                for r in recentes
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("Excluir um pagamento registrado por engano"):
+            st.caption("O valor volta a constar como devido pela cliente.")
+            opcoes_rec = {
+                f"{fmt_data(r['data'])} — {r['cliente']} — {brl(r['valor'])} ({r['vendas']})": r["lote"]
+                for r in recentes
+            }
+            escolha_rec = st.selectbox("Pagamento", list(opcoes_rec), key="fiado_excluir_sel")
+            if st.button("Excluir pagamento", key="fiado_excluir_btn"):
+                excluir_recebimento(opcoes_rec[escolha_rec])
+                st.session_state["fiado_sucesso"] = "Pagamento excluído."
+                st.rerun()
+
+
+def _aba_entregas():
+    st.caption("Vendas online ainda não entregues. Marque as que foram entregues.")
+    mensagem = st.session_state.pop("entrega_sucesso", None)
+    if mensagem:
+        st.success(mensagem)
+    versao = st.session_state.setdefault("entrega_versao", 0)
+    hoje = hoje_brasil()
+
+    pendentes = vendas_online(entregue=False)
+    if not pendentes:
+        st.success("Nenhuma venda online aguardando entrega.")
+    else:
+        st.metric("Aguardando entrega", len(pendentes), help=f"Somando {brl(sum(dec(v['valor_total']) for v in pendentes))}")
+        editado = st.data_editor(
+            pd.DataFrame(
+                [
+                    {
+                        "id": v["id"],
+                        "entregar": False,
+                        "venda": f"#{v['id']}",
+                        "data": fmt_data(v["data"]),
+                        "dias": (hoje - v["data"]).days,
+                        "cliente": v["cliente"] or "",
+                        "pecas": v["pecas"] or "",
+                        "valor": float(v["valor_total"]),
+                    }
+                    for v in pendentes
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled=["venda", "data", "dias", "cliente", "pecas", "valor"],
+            key=f"entregas_{versao}",
+            column_config={
+                "id": None,
+                "entregar": st.column_config.CheckboxColumn("Entregue?"),
+                "venda": st.column_config.TextColumn("Venda"),
+                "data": st.column_config.TextColumn("Data da venda"),
+                "dias": st.column_config.NumberColumn("Dias esperando", format="%d"),
+                "cliente": st.column_config.TextColumn("Cliente"),
+                "pecas": st.column_config.TextColumn("Peças", width="large"),
+                "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
+            },
+        )
+        marcadas = [int(i) for i in editado.loc[editado["entregar"] == True, "id"]]  # noqa: E712
+        data_entrega = st.date_input("Data da entrega", value=hoje, max_value=hoje, format="DD/MM/YYYY",
+                                     key=f"entrega_data_{versao}")
+        if st.button(
+            f"Marcar {len(marcadas)} como entregue(s)" if marcadas else "Marcar como entregue",
+            type="primary", disabled=not marcadas, key=f"entrega_btn_{versao}",
+        ):
+            feitas = marcar_entregues(marcadas, data_entrega)
+            st.session_state["entrega_sucesso"] = f"{feitas} venda(s) marcada(s) como entregue(s)."
+            st.session_state["entrega_versao"] = versao + 1
+            st.rerun()
+
+    entregues = vendas_online(entregue=True, limite=30)
+    if entregues:
+        st.divider()
+        st.subheader("Entregues recentemente")
+        st.dataframe(
+            [
+                {
+                    "Venda": f"#{v['id']}",
+                    "Data da venda": fmt_data(v["data"]),
+                    "Entregue em": fmt_data(v["data_entrega"]),
+                    "Cliente": v["cliente"] or "",
+                    "Peças": v["pecas"] or "",
+                    "Valor": brl(v["valor_total"]),
+                }
+                for v in entregues
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("Marcou como entregue por engano?"):
+            opcoes = {f"Venda #{v['id']} — {v['cliente'] or 'sem cliente'} — entregue em {fmt_data(v['data_entrega'])}": v["id"] for v in entregues}
+            escolha = st.selectbox("Venda", list(opcoes), key="entrega_desfazer_sel")
+            if st.button("Voltar para não entregue", key="entrega_desfazer_btn"):
+                desfazer_entrega(opcoes[escolha])
+                st.session_state["entrega_sucesso"] = "A venda voltou para a lista de entregas pendentes."
+                st.rerun()
+
+
 with aba_venda:
     if mensagem_venda:
         st.success(mensagem_venda)
     _aba_registrar_venda()
     _vendas_recentes()
+
+with aba_fiado:
+    _aba_fiado()
+
+with aba_entregas:
+    _aba_entregas()
 
 with aba_devolucao:
     _aba_devolucao()

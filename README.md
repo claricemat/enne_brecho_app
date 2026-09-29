@@ -26,7 +26,7 @@
 - `db.py` — conexão com o Postgres (Supabase) e função auxiliar `run_query`
 - `pages/1_Fornecedoras.py` — cadastro de fornecedoras
 - `pages/2_Compras.py` — registrar lote de compra (proposta aceita) e marcar pagamentos
-- `pages/3_Vendas.py` — registrar vendas (busca por código/ID, descrição ou marca; as peças marcadas ficam numa sacola que não se perde ao pesquisar outra peça) e aba "Devolução de peças"
+- `pages/3_Vendas.py` — registrar vendas (busca por código/ID, descrição ou marca; as peças marcadas ficam numa sacola que não se perde ao pesquisar outra peça) e abas "Cliente fiel (fiado)", "Entregas online" e "Devolução de peças"
 - `pages/5_Estoque.py` — estoque + sub-aba "Gerador de etiquetas"
 - `pages/6_Cadastros.py` — tipos de peça, tipos de compra, plano de contas (Grupo › Subgrupo › Analítico) e contas/caixa
 - `pages/8_Financeiro.py` — conciliação bancária, importação de extrato OFX e resumo por plano de contas
@@ -35,7 +35,8 @@
 - `ofx_parser.py` — leitor de arquivos OFX (versões 1 e 2)
 - `financeiro.py` — importação do extrato e conciliação no banco
 - `parcelas.py` — parcelamento (divisão em parcelas e o bloco de tela usado em Compras e Despesas)
-- `compras_parcelas.py` — consulta e reparcelamento das parcelas de uma compra
+- `compras_parcelas.py` — parcelas de uma compra (consulta e reparcelamento), excluir/desfazer compra e excluir avaliação
+- `controle_vendas.py` — fiado (cliente fiel: quem deve e pagamentos recebidos) e entregas das vendas online
 - `devolucoes.py` — devolução de peças vendidas (volta ao estoque e desconta da receita)
 - `pages/4_Despesas.py` — despesas à vista ou parceladas
 - `controle_pagamentos.py` — aba "Controle de pagamentos (peças)" da página de Compras (cartões, tabela filtrável, baixa com desconto e formas de pagamento combinadas)
@@ -44,7 +45,7 @@
 - `prazos_proposta.py` — condições das propostas da avaliação (à vista em até 10 dias; parcelada com nº de parcelas, 1ª em dias úteis e intervalo)
 - `formatacao.py` — valores e datas no padrão brasileiro
 - `db.py` — conexão com o banco; cada consulta usa o horário de Brasília (vendas depois das 21h ficam no dia certo)
-- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_proposta_parcelada.sql` (propostas da avaliação: à vista e/ou parcelada)
+- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_fiado_online.sql` (vendas loja/online com entrega e cliente fiel/fiado)
 
 ## Deploy no Streamlit Community Cloud
 
