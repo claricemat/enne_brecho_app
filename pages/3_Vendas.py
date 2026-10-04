@@ -1,5 +1,5 @@
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -205,6 +205,16 @@ def _aba_registrar_venda():
     )
 
     v = st.session_state.venda_version
+    hoje = hoje_brasil()
+    col_data, _ = st.columns(2)
+    data_venda = col_data.date_input(
+        "Data da venda", value=hoje, max_value=hoje, format="DD/MM/YYYY", key=f"venda_data_{v}",
+        help="Já vem com a data de hoje. Para lançar uma venda de outro dia, escolha uma data anterior.",
+    )
+    venda_retroativa = data_venda < hoje
+    if venda_retroativa:
+        col_data.caption(f"Venda de um dia anterior: vai ser registrada em {fmt_data(data_venda)}.")
+
     col1, col2 = st.columns(2)
     forma_pagamento = col1.selectbox(
         "Forma de pagamento",
@@ -262,16 +272,22 @@ def _aba_registrar_venda():
     if st.button("Registrar venda", type="primary", disabled=selecionados.empty or (fiado and not cliente)):
         subtotal = round(selecionados["preco_vendido"].sum(), 2)
         valor_total = round(max(subtotal - desconto, 0), 2)
+        if venda_retroativa:
+            # meio-dia no horário de Brasília: a venda nunca "escorrega" para outro dia
+            momento_venda = datetime(data_venda.year, data_venda.month, data_venda.day, 12, 0,
+                                     tzinfo=timezone(timedelta(hours=-3)))
+        else:
+            momento_venda = datetime.now(timezone.utc)
 
         try:
             # tudo numa transação: ou a venda inteira é gravada, ou nada
             with transacao() as executar:
                 venda_id = executar(
-                    "INSERT INTO venda (forma_pagamento, valor_total, cliente, desconto, plano_conta_id, "
-                    "canal, entregue, data_entrega) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                    (forma_pagamento, valor_total, cliente or None, desconto, plano_conta_id,
-                     canal, entregue, hoje_brasil() if entregue else None),
+                    "INSERT INTO venda (data_venda, forma_pagamento, valor_total, cliente, desconto, "
+                    "plano_conta_id, canal, entregue, data_entrega) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (momento_venda, forma_pagamento, valor_total, cliente or None, desconto,
+                     plano_conta_id, canal, entregue, data_venda if entregue else None),
                     fetch=True,
                 )[0]["id"]
 
@@ -310,7 +326,9 @@ def _aba_registrar_venda():
         if fiado:
             extras.append(f"fiado para {cliente}")
         st.session_state["venda_sucesso"] = (
-            f"Venda #{venda_id} registrada — {len(selecionados)} peça(s), "
+            f"Venda #{venda_id} registrada"
+            + (f" com data de {fmt_data(data_venda)}" if venda_retroativa else "")
+            + f" — {len(selecionados)} peça(s), "
             f"total {brl(valor_total)} (desconto de {brl(desconto)})"
             + (f" — {'; '.join(extras)}." if extras else ".")
         )
