@@ -13,6 +13,7 @@ import streamlit as st
 
 from db import transacao
 from cobrancas import alertas, excluir_cobranca, historico, nivel, registrar_cobranca
+from pagamento_parcial import PagamentoParcialInvalidoError, dividir_parcela_compra
 from exportacao_compras import gerar_excel_compras, gerar_pdf_compras
 from formatacao import brl as _brl
 from formatacao import fmt_data as _fmt_data
@@ -174,7 +175,9 @@ def _rotulo_parcela(p):
 
 
 def _registrar_pagamento(fornecedora_id, ids_parcelas, data_pagamento, valor_bruto,
-                         desconto, formas, observacao, usuario, descricao_parcelas):
+                         desconto, formas, observacao, usuario, descricao_parcelas, parcial=None):
+    """parcial: None, ou dict(parcela_id, valor_original, vencimento_restante) quando só uma
+    parte da parcela é paga (o restante vira uma parcela nova em aberto)."""
     with transacao() as executar:
         # trava as parcelas e confere que ninguém pagou enquanto esta tela estava aberta
         travadas = executar(
@@ -186,6 +189,12 @@ def _registrar_pagamento(fornecedora_id, ids_parcelas, data_pagamento, valor_bru
             raise ComprasJaPagasError(
                 "Alguma das parcelas selecionadas já foi paga ou alterada (talvez pela outra pessoa). "
                 "Atualize a página e confira antes de pagar de novo."
+            )
+
+        if parcial:
+            dividir_parcela_compra(
+                executar, parcial["parcela_id"], parcial["valor_original"], valor_bruto,
+                parcial["vencimento_restante"],
             )
 
         baixa = executar(
@@ -588,6 +597,36 @@ def _formulario_pagamento(dados, hoje):
     valor_bruto = sum((c["valor"] for c in parcelas_escolhidas), Decimal("0"))
     chave = f"{versao}_{fornecedora_id}_{'-'.join(map(str, ids))}"
 
+    # ---- pagamento parcial (só quando uma parcela é escolhida) ----
+    parcial = None
+    if len(parcelas_escolhidas) == 1 and valor_bruto >= Decimal("0.02"):
+        unica = parcelas_escolhidas[0]
+        if st.checkbox("Pagar só uma parte desta parcela", key=f"pag_parcial_{chave}",
+                       help="O restante continua em aberto como uma parcela nova, com o vencimento que você escolher."):
+            valor_parcial = _dec(st.number_input(
+                "Valor pago agora (R$)", min_value=0.01, max_value=float(valor_bruto - Decimal("0.01")),
+                value=float((valor_bruto / 2).quantize(Decimal("0.01"))), step=1.0, format="%.2f",
+                key=f"pag_parcial_valor_{chave}",
+            ))
+            venc_restante = None
+            if st.checkbox("Mudar o vencimento do restante", key=f"pag_parcial_mudar_{chave}"):
+                venc_restante = st.date_input(
+                    "O restante vence em", value=unica["data_vencimento"], format="DD/MM/YYYY",
+                    key=f"pag_parcial_venc_{chave}",
+                )
+            venc_txt = (
+                f"vencendo em {_fmt_data(venc_restante)}" if venc_restante
+                else f"com o mesmo vencimento ({_fmt_data(unica['data_vencimento'])})"
+            )
+            st.caption(
+                f"Fica: {_brl(valor_parcial)} pago agora e {_brl(valor_bruto - valor_parcial)} "
+                f"em aberto, {venc_txt}."
+            )
+            parcial = {"parcela_id": unica["id"], "valor_original": valor_bruto,
+                       "vencimento_restante": venc_restante, "texto": venc_txt}
+            valor_bruto = valor_parcial
+            chave = f"{chave}_parcial"
+
     # ---- data e desconto ----
     col_data, col_desc = st.columns(2)
     data_pagamento = col_data.date_input(
@@ -675,8 +714,9 @@ def _formulario_pagamento(dados, hoje):
                 fornecedora_id, ids, data_pagamento, valor_bruto, desconto,
                 formas_escolhidas, observacao.strip(), st.session_state.get("usuario"),
                 ", ".join(_rotulo_parcela(c) for c in parcelas_escolhidas),
+                parcial,
             )
-        except ComprasJaPagasError as e:
+        except (ComprasJaPagasError, PagamentoParcialInvalidoError) as e:
             st.error(str(e))
             return
         except Exception as e:
@@ -686,6 +726,8 @@ def _formulario_pagamento(dados, hoje):
         st.session_state["pag_sucesso"] = (
             f"Pagamento registrado: {len(ids)} parcela(s), {_brl(valor_a_pagar)} pagos"
             + (f" (desconto de {_brl(desconto)})" if desconto > 0 else "")
+            + (f"; restam {_brl(parcial['valor_original'] - valor_bruto)} em aberto, "
+               f"{parcial['texto']}" if parcial else "")
             + "."
         )
         st.session_state["pag_versao"] = versao + 1

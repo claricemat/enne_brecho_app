@@ -34,6 +34,7 @@
 - `plano.py` — funções do plano de contas (grupos, subgrupos, rótulos)
 - `ofx_parser.py` — leitor de arquivos OFX (versões 1 e 2)
 - `financeiro.py` — importação do extrato e conciliação no banco
+- `pagamento_parcial.py` — pagar só uma parte de uma despesa ou de uma parcela de compra (o restante continua em aberto, com o mesmo vencimento ou outro, se escolhido)
 - `parcelas.py` — parcelamento (divisão em parcelas e o bloco de tela usado em Compras e Despesas)
 - `compras_parcelas.py` — parcelas de uma compra (consulta e reparcelamento), excluir/desfazer compra e excluir avaliação
 - `cobrancas.py` — cobranças das fornecedoras e o alerta de quem está cobrando (com parcela em aberto)

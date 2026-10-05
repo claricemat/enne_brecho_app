@@ -4,6 +4,7 @@ from auth import botao_logout, exigir_login
 from branding import aplicar_logo
 from db import run_query, transacao
 from formatacao import brl, fmt_data, hoje_brasil
+from pagamento_parcial import PagamentoParcialInvalidoError, pagar_despesa_parcial
 from parcelas import dec, editor_parcelas
 
 st.set_page_config(page_title="Despesas", page_icon="assets/icone_coracao.png", layout="wide")
@@ -188,6 +189,56 @@ if pendentes:
         st.session_state["despesa_sucesso"] = f"{len(feitas)} despesa(s) marcada(s) como paga(s)."
         st.session_state["despesa_versao"] = versao + 1
         st.rerun()
+
+    # ---- pagamento parcial: paga uma parte agora, o restante continua em aberto ----
+    with st.expander("Pagar só uma parte de uma despesa"):
+        st.caption(
+            "Ex.: aluguel de R$ 400,00 — pagou R$ 250,00 agora e o restante depois. A parte paga "
+            "e o restante continuam com o mesmo vencimento; mudar o vencimento do restante é opcional."
+        )
+        por_rotulo = {r: next(d for d in pendentes if d["id"] == i) for r, i in opcoes_pendentes.items()}
+        escolha_parcial = st.selectbox(
+            "Despesa", list(por_rotulo), index=None, placeholder="Escolha a despesa",
+            key=f"desp_parcial_sel_{versao}",
+        )
+        if escolha_parcial:
+            alvo = por_rotulo[escolha_parcial]
+            valor_total_desp = float(alvo["valor"])
+            if valor_total_desp < 0.02:
+                st.info("Essa despesa é pequena demais para dividir.")
+            else:
+                valor_pago = st.number_input(
+                    "Valor pago agora (R$)", min_value=0.01, max_value=round(valor_total_desp - 0.01, 2),
+                    value=round(valor_total_desp / 2, 2), step=1.0, format="%.2f",
+                    key=f"desp_parcial_valor_{versao}_{alvo['id']}",
+                )
+                mudar_venc = st.checkbox(
+                    "Mudar o vencimento do restante", key=f"desp_parcial_mudar_{versao}_{alvo['id']}"
+                )
+                venc_restante = None
+                if mudar_venc:
+                    venc_restante = st.date_input(
+                        "O restante vence em", value=alvo["data"], format="DD/MM/YYYY",
+                        key=f"desp_parcial_venc_{versao}_{alvo['id']}",
+                    )
+                restante = dec(valor_total_desp) - dec(valor_pago)
+                venc_txt = (
+                    f"vencendo em {fmt_data(venc_restante)}" if venc_restante
+                    else f"com o mesmo vencimento ({fmt_data(alvo['data'])})"
+                )
+                st.caption(f"Fica: {brl(valor_pago)} pago e {brl(restante)} em aberto, {venc_txt}.")
+                if st.button("Registrar pagamento parcial", type="primary", key=f"desp_parcial_btn_{versao}"):
+                    try:
+                        pagar_despesa_parcial(alvo["id"], alvo["valor"], valor_pago, venc_restante)
+                    except PagamentoParcialInvalidoError as e:
+                        st.error(str(e))
+                    else:
+                        st.session_state["despesa_sucesso"] = (
+                            f"Pagamento parcial registrado: {brl(valor_pago)} pago; "
+                            f"restam {brl(restante)} em aberto, {venc_txt}."
+                        )
+                        st.session_state["despesa_versao"] = versao + 1
+                        st.rerun()
 
 # ------------------------------------------------------------
 # Lançamentos recentes + exclusão
