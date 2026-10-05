@@ -561,7 +561,7 @@ with aba_compra:
     compras = run_query(
         """
         SELECT c.id, tc.nome AS tipo_compra, COALESCE(f.nome, '—') AS fornecedora,
-               c.data_aceite, c.valor_total, c.data_vencimento, c.status, c.data_pagamento,
+               c.data_aceite, c.valor_total, c.data_vencimento, c.status, c.data_pagamento, c.observacao,
                COUNT(p.id) AS parcelas,
                COUNT(p.id) FILTER (WHERE p.status = 'pago') AS pagas,
                COALESCE(SUM(p.valor) FILTER (WHERE p.status = 'pendente'), 0) AS em_aberto
@@ -589,6 +589,7 @@ with aba_compra:
                     "Próximo vencimento": fmt_data(c["data_vencimento"]) if c["status"] == "pendente" else "—",
                     "Situação": "Paga" if c["status"] == "pago" else "Em aberto",
                     "Quitada em": fmt_data(c["data_pagamento"]) if c["status"] == "pago" else "—",
+                    "Observação": c["observacao"] or "",
                 }
                 for c in compras
             ],

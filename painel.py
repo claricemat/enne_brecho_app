@@ -7,6 +7,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from cobrancas import alertas
 from db import transacao
 from formatacao import brl, fmt_data, hoje_brasil
 
@@ -378,8 +379,28 @@ def _cartao(coluna, titulo, valor, legenda, ajuda=None):
         st.caption(legenda)
 
 
+def _aviso_cobrancas(hoje):
+    """Fornecedoras que cobraram e ainda têm parcela em aberto (detalhes no Controle de pagamentos)."""
+    lista = alertas(hoje)
+    if not lista:
+        return
+    partes = []
+    for a in lista[:4]:
+        txt = f"{a['fornecedora']} ({a['cobrancas']} cobrança{'s' if a['cobrancas'] > 1 else ''}"
+        if a["em_atraso"]:
+            txt += f", {brl(a['em_atraso'])} em atraso"
+        partes.append(txt + ")")
+    resto = f" e mais {len(lista) - 4}" if len(lista) > 4 else ""
+    texto = (
+        f"⚠ Fornecedora(s) cobrando pagamento: {', '.join(partes)}{resto}. "
+        "Veja em Compras › Controle de pagamentos (peças)."
+    )
+    (st.error if any(a["em_atraso"] for a in lista) else st.warning)(texto)
+
+
 def renderizar_painel():
     hoje = hoje_brasil()
+    _aviso_cobrancas(hoje)
     primeiro_dia = hoje.replace(day=1)
     ultimo_dia = (primeiro_dia + timedelta(days=32)).replace(day=1) - timedelta(days=1)
 

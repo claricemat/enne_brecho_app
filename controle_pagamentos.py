@@ -12,6 +12,7 @@ from decimal import Decimal
 import streamlit as st
 
 from db import transacao
+from cobrancas import alertas, excluir_cobranca, historico, nivel, registrar_cobranca
 from exportacao_compras import gerar_excel_compras, gerar_pdf_compras
 from formatacao import brl as _brl
 from formatacao import fmt_data as _fmt_data
@@ -79,7 +80,7 @@ def _carregar_dados(hoje, inicio, fim):
                    (SELECT COUNT(*) FROM compra_parcela x WHERE x.compra_id = p.compra_id) AS total_parcelas,
                    c.fornecedora_id,
                    COALESCE(f.nome, '— sem fornecedora —') AS fornecedora,
-                   tc.nome AS tipo_compra, c.data_aceite, p.data_vencimento, p.valor
+                   tc.nome AS tipo_compra, c.data_aceite, p.data_vencimento, p.valor, c.observacao
             FROM compra_parcela p
             JOIN compra c ON c.id = p.compra_id
             JOIN tipo_compra tc ON tc.id = c.tipo_compra_id
@@ -278,6 +279,11 @@ def renderizar_controle_pagamentos():
             "fora do período selecionado."
         )
 
+    # ---- cobranças das fornecedoras (alerta de quem está cobrando) ----
+    dados["alertas"] = {a["fornecedora_id"]: a for a in alertas(hoje)}
+    st.divider()
+    _secao_cobrancas(dados, hoje)
+
     # ---- tabela de compras do período ----
     st.divider()
     _tabela_compras(dados["compras_periodo"], hoje, inicio, fim)
@@ -422,6 +428,95 @@ def _tabela_compras(compras_periodo, hoje, inicio, fim):
         )
 
 
+# ----------------------------------------------------------------
+# Cobranças das fornecedoras
+# ----------------------------------------------------------------
+def _secao_cobrancas(dados, hoje):
+    st.subheader("Cobranças das fornecedoras")
+    mensagem = st.session_state.pop("cobranca_sucesso", None)
+    if mensagem:
+        st.success(mensagem)
+    versao = st.session_state.setdefault("cobranca_versao", 0)
+
+    lista = list(dados["alertas"].values())
+    if lista:
+        com_atraso = [a for a in lista if a["em_atraso"] > 0]
+        texto = f"{len(lista)} fornecedora(s) cobrando pagamento"
+        if com_atraso:
+            texto += f" — {len(com_atraso)} com parcela em atraso ({_brl(sum(a['em_atraso'] for a in com_atraso))})"
+        (st.error if com_atraso else st.warning)(texto + ". Quem cobrou mais vezes aparece primeiro.")
+        st.dataframe(
+            [
+                {
+                    "Alerta": nivel(a["cobrancas"]),
+                    "Fornecedora": a["fornecedora"],
+                    "Contato": a["contato"] or "",
+                    "Cobranças": a["cobrancas"],
+                    "Última cobrança": _fmt_data(a["ultima"]),
+                    "Em atraso": _brl(a["em_atraso"]) if a["em_atraso"] else "—",
+                    "Em aberto": _brl(a["em_aberto"]),
+                    "Próximo vencimento": _fmt_data(a["proximo_vencimento"]),
+                }
+                for a in lista
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("Nenhuma fornecedora cobrando no momento.")
+
+    with st.expander("Registrar cobrança"):
+        st.caption(
+            "Sempre que uma fornecedora cobrar, registre aqui. O alerta conta as cobranças feitas "
+            "depois do último pagamento a ela e some quando ela é paga."
+        )
+        devendo = {}
+        for c in dados["pendentes"]:
+            if c["fornecedora_id"] is not None:
+                devendo.setdefault(c["fornecedora_id"], c["fornecedora"])
+        if not devendo:
+            st.info("Nenhuma fornecedora com parcela em aberto.")
+        else:
+            nomes = {nome: fid for fid, nome in sorted(devendo.items(), key=lambda x: x[1].casefold())}
+            col1, col2 = st.columns(2)
+            escolha = col1.selectbox("Fornecedora", list(nomes), index=None, placeholder="Quem cobrou?",
+                                     key=f"cobranca_forn_{versao}")
+            data = col2.date_input("Data da cobrança", value=hoje, max_value=hoje, format="DD/MM/YYYY",
+                                   key=f"cobranca_data_{versao}")
+            obs = st.text_input("Observação (opcional)", placeholder="ex: mandou mensagem no WhatsApp",
+                                key=f"cobranca_obs_{versao}")
+            if st.button("Registrar cobrança", disabled=escolha is None, key=f"cobranca_btn_{versao}"):
+                registrar_cobranca(nomes[escolha], data, obs.strip(), st.session_state.get("usuario"))
+                st.session_state["cobranca_sucesso"] = f"Cobrança de {escolha} registrada em {_fmt_data(data)}."
+                st.session_state["cobranca_versao"] = versao + 1
+                st.rerun()
+
+    registros = historico()
+    if registros:
+        with st.expander("Histórico de cobranças"):
+            st.dataframe(
+                [
+                    {
+                        "Data": _fmt_data(r["data"]),
+                        "Fornecedora": r["fornecedora"],
+                        "Observação": r["observacao"] or "",
+                        "Registrada por": r["criado_por"] or "",
+                    }
+                    for r in registros
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            opcoes = {f"{_fmt_data(r['data'])} — {r['fornecedora']}" + (f" — {r['observacao']}" if r["observacao"] else ""): r["id"]
+                      for r in registros}
+            escolha_exc = st.selectbox("Excluir uma cobrança registrada por engano", list(opcoes),
+                                       key="cobranca_excluir_sel")
+            if st.button("Excluir cobrança", key="cobranca_excluir_btn"):
+                excluir_cobranca(opcoes[escolha_exc])
+                st.session_state["cobranca_sucesso"] = "Cobrança excluída."
+                st.rerun()
+
+
 def _formulario_pagamento(dados, hoje):
     versao = st.session_state.setdefault("pag_versao", 0)
 
@@ -430,8 +525,14 @@ def _formulario_pagamento(dados, hoje):
     for c in dados["pendentes"]:
         por_fornecedora.setdefault(c["fornecedora_id"], []).append(c)
 
+    alertas_forn = dados.get("alertas", {})
+    ordem = sorted(
+        por_fornecedora,
+        key=lambda fid: -(alertas_forn[fid]["cobrancas"] if fid in alertas_forn else 0),
+    )
     opcoes_fornecedora = {}
-    for forn_id, compras in por_fornecedora.items():
+    for forn_id in ordem:
+        compras = por_fornecedora[forn_id]
         em_aberto = sum((c["valor"] for c in compras), Decimal("0"))
         em_atraso = sum(
             (c["valor"] for c in compras if c["data_vencimento"] and c["data_vencimento"] < hoje),
@@ -440,11 +541,20 @@ def _formulario_pagamento(dados, hoje):
         rotulo = f"{compras[0]['fornecedora']} — {_brl(em_aberto)} em aberto"
         if em_atraso > 0:
             rotulo += f" ({_brl(em_atraso)} em atraso)"
+        if forn_id in alertas_forn:
+            rotulo = "⚠ " + rotulo + f" — {nivel(alertas_forn[forn_id]['cobrancas'])}"
         opcoes_fornecedora[rotulo] = forn_id
 
     escolha = st.selectbox("Fornecedora", list(opcoes_fornecedora), key=f"pag_forn_{versao}")
     fornecedora_id = opcoes_fornecedora[escolha]
     compras_forn = por_fornecedora[fornecedora_id]
+
+    if fornecedora_id in alertas_forn:
+        a = alertas_forn[fornecedora_id]
+        st.warning(
+            f"{a['fornecedora']} já cobrou {a['cobrancas']} vez(es) desde o último pagamento "
+            f"(última cobrança em {_fmt_data(a['ultima'])})."
+        )
 
     credito = dados["creditos"].get(fornecedora_id)
     if fornecedora_id is not None and credito and credito > 0:
@@ -454,8 +564,9 @@ def _formulario_pagamento(dados, hoje):
     opcoes_compra = {}
     for c in compras_forn:
         parcela_txt = f" — parcela {c['numero']}/{c['total_parcelas']}" if c["total_parcelas"] > 1 else ""
+        obs_txt = f" ({c['observacao']})" if c.get("observacao") else ""
         rotulo = (
-            f"Compra #{c['compra_id']}{parcela_txt} — {c['tipo_compra']} — "
+            f"Compra #{c['compra_id']}{obs_txt}{parcela_txt} — {c['tipo_compra']} — "
             f"venc. {_fmt_data(c['data_vencimento'])} — {_brl(c['valor'])}"
         )
         if c["data_vencimento"] and c["data_vencimento"] < hoje:
