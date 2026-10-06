@@ -30,7 +30,8 @@ def descricao_restante(descricao):
     return (base + SUFIXO_RESTANTE) if base else "Restante"
 
 
-def pagar_despesa_parcial(despesa_id, valor_esperado, valor_pago, vencimento_restante=None):
+def pagar_despesa_parcial(despesa_id, valor_esperado, valor_pago, vencimento_restante=None,
+                          conta_financeira_id=None, data_pagamento=None):
     """Registra o pagamento de parte de uma despesa pendente. A parte paga mantém
     a data (vencimento) da despesa; o restante também, a não ser que
     vencimento_restante seja informado. Retorna o id da nova despesa com o restante."""
@@ -48,10 +49,11 @@ def pagar_despesa_parcial(despesa_id, valor_esperado, valor_pago, vencimento_res
         if not (Decimal("0") < valor_pago < valor_esperado):
             raise PagamentoParcialInvalidoError("O valor pago precisa ser maior que zero e menor que o valor da despesa.")
 
-        # a parte paga mantém o vencimento da despesa
+        # a parte paga mantém o vencimento da despesa e guarda de onde e quando foi paga
         executar(
-            "UPDATE despesa SET valor = %s, status_pagamento = 'pago' WHERE id = %s",
-            (valor_pago, despesa_id),
+            "UPDATE despesa SET valor = %s, status_pagamento = 'pago', "
+            "conta_financeira_id = %s, data_pagamento = %s WHERE id = %s",
+            (valor_pago, conta_financeira_id, data_pagamento, despesa_id),
         )
         # o restante continua em aberto (mesma categoria e, se for parcela, mesma parcela)
         nova = executar(

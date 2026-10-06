@@ -198,10 +198,10 @@ with col1:
         st.info("Sem vendas no período.")
 
 with col2:
-    st.subheader("Despesas por categoria")
+    st.subheader("Despesas por conta (plano de contas)")
     despesas_por_conta = run_query(
         """
-        SELECT pc.nome AS conta, COALESCE(SUM(d.valor), 0) AS total
+        SELECT pc.subgrupo || ' › ' || pc.nome AS conta, COALESCE(SUM(d.valor), 0) AS total
         FROM despesa d
         JOIN plano_contas pc ON pc.id = d.plano_conta_id
         WHERE d.data BETWEEN %s AND %s

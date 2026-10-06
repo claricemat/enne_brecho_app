@@ -6,6 +6,7 @@ from db import run_query, transacao
 from formatacao import brl, fmt_data, hoje_brasil
 from pagamento_parcial import PagamentoParcialInvalidoError, pagar_despesa_parcial
 from parcelas import dec, editor_parcelas
+from plano import GRUPOS, carregar_contas
 
 st.set_page_config(page_title="Despesas", page_icon="assets/icone_coracao.png", layout="wide")
 aplicar_logo()
@@ -13,16 +14,25 @@ exigir_login()
 botao_logout()
 st.title("Despesas")
 
-contas_despesa = run_query(
-    "SELECT id, nome FROM plano_contas WHERE tipo = 'despesa' ORDER BY nome"
-)
+# contas analíticas do plano de contas que podem receber despesas (grupos Despesa e Custo)
+contas_despesa = [c for c in carregar_contas() if c["tipo"] in ("despesa", "custo")]
 if not contas_despesa:
     st.warning(
-        "Nenhuma categoria de despesa cadastrada. Vá em Cadastros → Plano de contas e crie uma."
+        "Nenhuma conta de despesa no plano de contas. Vá em Cadastros → Plano de contas e crie uma "
+        "(grupo Despesa ou Custo)."
     )
     st.stop()
 
-opcoes_conta = {c["nome"]: c["id"] for c in contas_despesa}
+opcoes_conta = {
+    f"{c['nome']}  ({GRUPOS[c['tipo']]} › {c['subgrupo']})": c["id"] for c in contas_despesa
+}
+
+# de onde sai o dinheiro: contas bancárias e caixa (Cadastros → Contas e caixa)
+contas_pagamento = run_query("SELECT id, nome, tipo FROM conta_financeira ORDER BY tipo DESC, nome")
+opcoes_pagamento = {
+    f"{c['nome']} ({'caixa' if c['tipo'] == 'caixa' else 'conta bancária'})": c["id"]
+    for c in contas_pagamento
+}
 hoje = hoje_brasil()
 versao = st.session_state.setdefault("despesa_versao", 0)
 usuario = st.session_state.get("usuario")
@@ -36,12 +46,36 @@ def _rotulo_parcela(d):
     return f"{d['parcela_numero']}/{d['parcela_total']}" if d["parcelamento_id"] else "—"
 
 
+def _rotulo_plano(d):
+    return f"{d['subgrupo']} › {d['categoria']}"
+
+
+def _campos_pagamento(chave, data_padrao, rotulo_conta="Paga com (conta ou caixa)*"):
+    """Conta/caixa de onde saiu o dinheiro + data do pagamento. Retorna (conta_id, data, erro)."""
+    if not opcoes_pagamento:
+        erro = "Cadastre uma conta bancária ou o caixa em Cadastros → Contas e caixa para registrar pagamentos."
+        st.warning(erro)
+        return None, None, erro
+    c1, c2 = st.columns(2)
+    escolha = c1.selectbox(rotulo_conta, list(opcoes_pagamento), index=None,
+                           placeholder="De onde saiu o dinheiro?", key=f"{chave}_conta")
+    data_pag = c2.date_input("Data do pagamento*", value=min(data_padrao, hoje), max_value=hoje,
+                             format="DD/MM/YYYY", key=f"{chave}_datapag")
+    if escolha is None:
+        return None, data_pag, "Informe a conta ou o caixa de onde saiu o pagamento."
+    return opcoes_pagamento[escolha], data_pag, None
+
+
 # ------------------------------------------------------------
 # Registrar despesa (à vista ou parcelada)
 # ------------------------------------------------------------
 st.subheader("Registrar despesa")
 col1, col2 = st.columns(2)
-nome_categoria = col1.selectbox("Categoria*", options=list(opcoes_conta), key=f"desp_cat_{versao}")
+nome_categoria = col1.selectbox(
+    "Conta (plano de contas)*", options=list(opcoes_conta), index=None,
+    placeholder="Ex.: Aluguel, Energia, Embalagens…", key=f"desp_cat_{versao}",
+    help="Contas analíticas dos grupos Despesa e Custo do plano de contas (Cadastros → Plano de contas).",
+)
 valor = col2.number_input(
     "Valor total (R$)*", min_value=0.0, step=1.0, format="%.2f", key=f"desp_valor_{versao}"
 )
@@ -53,10 +87,14 @@ parcelar = st.checkbox(
 )
 
 parcelas, erro = [], None
+conta_pag, data_pag, erro_pag = None, None, None
+primeira_paga = False
 if not parcelar:
     col3, col4 = st.columns(2)
-    data_despesa = col3.date_input("Data*", value=hoje, format="DD/MM/YYYY", key=f"desp_data_{versao}")
+    data_despesa = col3.date_input("Data / vencimento*", value=hoje, format="DD/MM/YYYY", key=f"desp_data_{versao}")
     status_pagamento = col4.selectbox("Status", ["pago", "pendente"], key=f"desp_status_{versao}")
+    if status_pagamento == "pago":
+        conta_pag, data_pag, erro_pag = _campos_pagamento(f"desp_pag_{versao}", data_despesa)
 elif valor <= 0:
     st.info("Informe o valor total para montar as parcelas.")
 else:
@@ -77,17 +115,29 @@ else:
         "A 1ª parcela já foi paga", key=f"desp_primeira_paga_{versao}",
         help="As demais entram como pendentes; marque cada uma como paga quando pagar.",
     )
+    if primeira_paga and parcelas:
+        conta_pag, data_pag, erro_pag = _campos_pagamento(
+            f"desp_pag1_{versao}", parcelas[0]["data_vencimento"], "1ª parcela paga com (conta ou caixa)*"
+        )
 
-if st.button("Registrar", type="primary", key=f"desp_registrar_{versao}", disabled=parcelar and bool(erro or not parcelas)):
+if erro_pag and (status_pagamento == "pago" if not parcelar else primeira_paga):
+    st.caption(f"⚠ {erro_pag}")
+if st.button(
+    "Registrar", type="primary", key=f"desp_registrar_{versao}",
+    disabled=(parcelar and bool(erro or not parcelas)) or nome_categoria is None or bool(erro_pag),
+):
     if valor <= 0:
         st.error("Informe um valor maior que zero.")
     elif not parcelar:
+        pago = status_pagamento == "pago"
         run_query(
             """
-            INSERT INTO despesa (plano_conta_id, descricao, valor, data, status_pagamento)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO despesa (plano_conta_id, descricao, valor, data, status_pagamento,
+                                 conta_financeira_id, data_pagamento)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (opcoes_conta[nome_categoria], descricao.strip() or None, valor, data_despesa, status_pagamento),
+            (opcoes_conta[nome_categoria], descricao.strip() or None, valor, data_despesa, status_pagamento,
+             conta_pag if pago else None, data_pag if pago else None),
             fetch=False,
         )
         st.session_state["despesa_sucesso"] = f"Despesa de {brl(valor)} registrada."
@@ -108,13 +158,15 @@ if st.button("Registrar", type="primary", key=f"desp_registrar_{versao}", disabl
                         """
                         INSERT INTO despesa
                             (plano_conta_id, descricao, valor, data, status_pagamento,
-                             parcelamento_id, parcela_numero, parcela_total)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                             parcelamento_id, parcela_numero, parcela_total,
+                             conta_financeira_id, data_pagamento)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             opcoes_conta[nome_categoria], descricao.strip() or None, p["valor"],
                             p["data_vencimento"], "pago" if paga else "pendente",
                             parcelamento, p["numero"], len(parcelas),
+                            conta_pag if paga else None, data_pag if paga else None,
                         ),
                     )
         except Exception as e:
@@ -155,7 +207,7 @@ col3.metric("Pendentes vencidas", brl(resumo["total_atrasado"]))
 # ------------------------------------------------------------
 pendentes = run_query(
     """
-    SELECT d.id, d.data, pc.nome AS categoria, d.descricao, d.valor,
+    SELECT d.id, d.data, pc.nome AS categoria, pc.subgrupo, d.descricao, d.valor,
            d.parcelamento_id, d.parcela_numero, d.parcela_total
     FROM despesa d
     JOIN plano_contas pc ON pc.id = d.plano_conta_id
@@ -167,7 +219,7 @@ if pendentes:
     st.subheader("Marcar como paga")
     opcoes_pendentes = {}
     for d in pendentes:
-        rotulo = f"#{d['id']} — {fmt_data(d['data'])} — {d['categoria']}"
+        rotulo = f"#{d['id']} — {fmt_data(d['data'])} — {_rotulo_plano(d)}"
         if d["descricao"]:
             rotulo += f" ({d['descricao']})"
         if d["parcelamento_id"]:
@@ -180,11 +232,15 @@ if pendentes:
         "Despesas pagas", options=list(opcoes_pendentes), key=f"desp_pagar_{versao}",
         placeholder="Escolha uma ou mais",
     )
-    if st.button("Marcar como paga(s)", disabled=not escolhidas, key="desp_btn_pagar"):
+    conta_marcar, data_marcar, erro_marcar = (None, None, None)
+    if escolhidas:
+        conta_marcar, data_marcar, erro_marcar = _campos_pagamento(f"desp_marcar_{versao}", hoje)
+    if st.button("Marcar como paga(s)", disabled=not escolhidas or bool(erro_marcar), key="desp_btn_pagar"):
         ids = [opcoes_pendentes[r] for r in escolhidas]
         feitas = run_query(
-            "UPDATE despesa SET status_pagamento = 'pago' WHERE id = ANY(%s) AND status_pagamento = 'pendente' RETURNING id",
-            (ids,),
+            "UPDATE despesa SET status_pagamento = 'pago', conta_financeira_id = %s, data_pagamento = %s "
+            "WHERE id = ANY(%s) AND status_pagamento = 'pendente' RETURNING id",
+            (conta_marcar, data_marcar, ids),
         )
         st.session_state["despesa_sucesso"] = f"{len(feitas)} despesa(s) marcada(s) como paga(s)."
         st.session_state["despesa_versao"] = versao + 1
@@ -226,10 +282,13 @@ if pendentes:
                     f"vencendo em {fmt_data(venc_restante)}" if venc_restante
                     else f"com o mesmo vencimento ({fmt_data(alvo['data'])})"
                 )
+                conta_parc, data_parc, erro_parc = _campos_pagamento(f"desp_parcial_pag_{versao}_{alvo['id']}", hoje)
                 st.caption(f"Fica: {brl(valor_pago)} pago e {brl(restante)} em aberto, {venc_txt}.")
-                if st.button("Registrar pagamento parcial", type="primary", key=f"desp_parcial_btn_{versao}"):
+                if st.button("Registrar pagamento parcial", type="primary", key=f"desp_parcial_btn_{versao}",
+                             disabled=bool(erro_parc)):
                     try:
-                        pagar_despesa_parcial(alvo["id"], alvo["valor"], valor_pago, venc_restante)
+                        pagar_despesa_parcial(alvo["id"], alvo["valor"], valor_pago, venc_restante,
+                                              conta_parc, data_parc)
                     except PagamentoParcialInvalidoError as e:
                         st.error(str(e))
                     else:
@@ -246,10 +305,12 @@ if pendentes:
 st.subheader("Despesas registradas recentemente")
 despesas = run_query(
     """
-    SELECT d.id, d.data, pc.nome AS categoria, d.descricao, d.valor, d.status_pagamento,
-           d.parcelamento_id, d.parcela_numero, d.parcela_total
+    SELECT d.id, d.data, pc.nome AS categoria, pc.subgrupo, d.descricao, d.valor, d.status_pagamento,
+           d.parcelamento_id, d.parcela_numero, d.parcela_total, d.data_pagamento,
+           cf.nome AS conta_pagamento
     FROM despesa d
     JOIN plano_contas pc ON pc.id = d.plano_conta_id
+    LEFT JOIN conta_financeira cf ON cf.id = d.conta_financeira_id
     ORDER BY d.id DESC LIMIT 40
     """
 )
@@ -260,11 +321,14 @@ if despesas:
             {
                 "Nº": d["id"],
                 "Data / vencimento": fmt_data(d["data"]),
-                "Categoria": d["categoria"],
+                "Conta (plano de contas)": _rotulo_plano(d),
                 "Descrição": d["descricao"] or "",
                 "Parcela": _rotulo_parcela(d),
                 "Valor": brl(d["valor"]),
                 "Status": d["status_pagamento"],
+                "Paga com": (d["conta_pagamento"] or "não informado") if d["status_pagamento"] == "pago" else "—",
+                "Paga em": (fmt_data(d["data_pagamento"]) if d["data_pagamento"] else "não informado")
+                           if d["status_pagamento"] == "pago" else "—",
             }
             for d in despesas
         ],
@@ -275,7 +339,7 @@ if despesas:
     st.subheader("Excluir despesa")
     st.caption("Para corrigir um lançamento errado.")
     opcoes_todas = {
-        f"#{d['id']} — {fmt_data(d['data'])} — {d['categoria']}"
+        f"#{d['id']} — {fmt_data(d['data'])} — {_rotulo_plano(d)}"
         + (f" — parcela {_rotulo_parcela(d)}" if d["parcelamento_id"] else "")
         + f" — {brl(d['valor'])}": d
         for d in despesas
