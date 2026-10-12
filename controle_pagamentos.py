@@ -1,9 +1,11 @@
-"""Aba "Controle de pagamentos (peças)" da página de Compras.
+"""Abas de pagamento das compras de peças, na página de Compras.
 
-Mostra o que falta pagar das compras de peças (a pagar / em atraso / total pago
-no período) e permite dar baixa nas parcelas escolhendo a fornecedora, aplicando
-desconto e combinando até duas formas de pagamento (conta bancária, caixa ou
-crédito na loja). Uma compra à vista tem 1 parcela; uma parcelada, várias.
+- "Controle de pagamentos (peças)": o que falta pagar (a pagar / em atraso /
+  total pago no período), cobranças das fornecedoras e histórico.
+- "Pagar fornecedoras" (formulário): dá baixa nas parcelas escolhendo a
+  fornecedora, aplicando desconto e combinando até duas formas de pagamento
+  (conta bancária, caixa ou crédito na loja). Uma compra à vista tem 1 parcela;
+  uma parcelada, várias.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -42,6 +44,43 @@ def _dec(valor):
 # ----------------------------------------------------------------
 # Leitura (tudo numa conexão só, porque as abas do Streamlit rodam a cada interação)
 # ----------------------------------------------------------------
+_SQL_PENDENTES = """
+    SELECT p.id, p.compra_id, p.numero,
+           (SELECT COUNT(*) FROM compra_parcela x WHERE x.compra_id = p.compra_id) AS total_parcelas,
+           c.fornecedora_id,
+           COALESCE(f.nome, '— sem fornecedora —') AS fornecedora,
+           tc.nome AS tipo_compra, c.data_aceite, p.data_vencimento, p.valor, c.observacao
+    FROM compra_parcela p
+    JOIN compra c ON c.id = p.compra_id
+    JOIN tipo_compra tc ON tc.id = c.tipo_compra_id
+    LEFT JOIN fornecedora f ON f.id = c.fornecedora_id
+    WHERE p.status = 'pendente'
+    ORDER BY f.nome NULLS LAST, p.data_vencimento, p.compra_id, p.numero
+"""
+
+_SQL_CREDITOS = """
+    SELECT fornecedora_id,
+           SUM(CASE WHEN tipo = 'entrada' THEN valor ELSE -valor END) AS saldo
+    FROM credito_loja_movimento
+    GROUP BY fornecedora_id
+"""
+
+_SQL_CONTAS = "SELECT id, nome, tipo FROM conta_financeira ORDER BY tipo, nome"
+
+
+def _carregar_para_pagar():
+    """Só o que o formulário de pagamento precisa (parcelas em aberto, créditos, contas)."""
+    with transacao() as q:
+        pendentes = q(_SQL_PENDENTES, fetch=True)
+        creditos = q(_SQL_CREDITOS, fetch=True)
+        contas = q(_SQL_CONTAS, fetch=True)
+    return {
+        "pendentes": pendentes,
+        "creditos": {c["fornecedora_id"]: c["saldo"] for c in creditos},
+        "contas": contas,
+    }
+
+
 def _carregar_dados(hoje, inicio, fim):
     with transacao() as q:
         resumo = q(
@@ -75,34 +114,9 @@ def _carregar_dados(hoje, inicio, fim):
             fetch=True,
         )[0]
 
-        pendentes = q(
-            """
-            SELECT p.id, p.compra_id, p.numero,
-                   (SELECT COUNT(*) FROM compra_parcela x WHERE x.compra_id = p.compra_id) AS total_parcelas,
-                   c.fornecedora_id,
-                   COALESCE(f.nome, '— sem fornecedora —') AS fornecedora,
-                   tc.nome AS tipo_compra, c.data_aceite, p.data_vencimento, p.valor, c.observacao
-            FROM compra_parcela p
-            JOIN compra c ON c.id = p.compra_id
-            JOIN tipo_compra tc ON tc.id = c.tipo_compra_id
-            LEFT JOIN fornecedora f ON f.id = c.fornecedora_id
-            WHERE p.status = 'pendente'
-            ORDER BY f.nome NULLS LAST, p.data_vencimento, p.compra_id, p.numero
-            """,
-            fetch=True,
-        )
-
-        creditos = q(
-            """
-            SELECT fornecedora_id,
-                   SUM(CASE WHEN tipo = 'entrada' THEN valor ELSE -valor END) AS saldo
-            FROM credito_loja_movimento
-            GROUP BY fornecedora_id
-            """,
-            fetch=True,
-        )
-
-        contas = q("SELECT id, nome, tipo FROM conta_financeira ORDER BY tipo, nome", fetch=True)
+        pendentes = q(_SQL_PENDENTES, fetch=True)
+        creditos = q(_SQL_CREDITOS, fetch=True)
+        contas = q(_SQL_CONTAS, fetch=True)
 
         compras_periodo = q(
             """
@@ -241,13 +255,9 @@ def _registrar_pagamento(fornecedora_id, ids_parcelas, data_pagamento, valor_bru
 def renderizar_controle_pagamentos():
     hoje = _hoje()
     st.caption(
-        "Acompanhe o que falta pagar das compras de peças e dê baixa nas parcelas, com "
-        "desconto e até duas formas de pagamento. Compra à vista = 1 parcela."
+        "Acompanhe o que falta pagar e o que já foi pago das compras de peças. "
+        "Para pagar uma fornecedora ou mudar vencimentos, use a aba Pagar fornecedoras."
     )
-
-    mensagem = st.session_state.pop("pag_sucesso", None)
-    if mensagem:
-        st.success(mensagem)
 
     # ---- período ----
     primeiro_dia = hoje.replace(day=1)
@@ -297,16 +307,6 @@ def renderizar_controle_pagamentos():
     st.divider()
     _tabela_compras(dados["compras_periodo"], hoje, inicio, fim)
 
-    # ---- pagar fornecedora ----
-    st.divider()
-    st.subheader("Pagar fornecedora")
-    st.caption("Aqui aparecem todas as parcelas em aberto, independentemente do período acima.")
-
-    if not dados["pendentes"]:
-        st.success("Nenhuma parcela em aberto. Tudo pago!")
-    else:
-        _formulario_pagamento(dados, hoje)
-
     # ---- histórico ----
     st.divider()
     st.subheader("Pagamentos do período")
@@ -314,6 +314,26 @@ def renderizar_controle_pagamentos():
         st.dataframe(dados["historico"], use_container_width=True, hide_index=True)
     else:
         st.info("Nenhum pagamento registrado por aqui nesse período.")
+
+
+def renderizar_pagar_fornecedora():
+    """Formulário de pagamento das parcelas em aberto (todas, de qualquer período)."""
+    hoje = _hoje()
+    st.subheader("Pagar fornecedora")
+    st.caption(
+        "Dê baixa nas parcelas em aberto, com desconto e até duas formas de pagamento. "
+        "Compra à vista = 1 parcela. Dá para pagar só uma parte de uma parcela."
+    )
+    mensagem = st.session_state.pop("pag_sucesso", None)
+    if mensagem:
+        st.success(mensagem)
+
+    dados = _carregar_para_pagar()
+    if not dados["pendentes"]:
+        st.success("Nenhuma parcela em aberto. Tudo pago!")
+        return
+    dados["alertas"] = {a["fornecedora_id"]: a for a in alertas(hoje)}
+    _formulario_pagamento(dados, hoje)
 
 
 # ----------------------------------------------------------------

@@ -7,7 +7,8 @@ from db import run_query, transacao
 from branding import aplicar_logo
 from auth import exigir_login, botao_logout
 from pdf_avaliacao import gerar_pdf_avaliacao
-from controle_pagamentos import renderizar_controle_pagamentos
+from controle_pagamentos import renderizar_controle_pagamentos, renderizar_pagar_fornecedora
+from editar_compra import EdicaoCompraError, atualizar_precos_venda, compras_para_editar, pecas_da_compra
 from formatacao import brl, fmt_data, hoje_brasil
 from parcelas import dec, editor_parcelas
 from compras_parcelas import (
@@ -223,8 +224,8 @@ def _nomes_propostas(config):
     return " e ".join(nomes)
 
 
-aba_compra, aba_avaliacao, aba_pagamentos = st.tabs(
-    ["Registrar Compra", "Avaliação de Peças", "Controle de pagamentos (peças)"]
+aba_compra, aba_avaliacao, aba_pagar, aba_pagamentos = st.tabs(
+    ["Registrar Compra", "Avaliação de Peças", "Pagar fornecedoras", "Controle de pagamentos (peças)"]
 )
 
 # ================================================================
@@ -421,7 +422,7 @@ with aba_compra:
             horizontal=True,
             key=f"compra_modo_{versao_compra}_{tipo_selecionado['id']}_{proposta_escolhida or ''}",
             help="Qualquer tipo de compra pode ser parcelado. As parcelas são pagas "
-                 "na aba Controle de pagamentos (peças).",
+                 "na aba Pagar fornecedoras.",
         )
         if modo_pagamento == A_PRAZO:
             if proposta_escolhida:
@@ -596,86 +597,133 @@ with aba_compra:
             use_container_width=True,
             hide_index=True,
         )
-        st.caption("Pra pagar uma parcela em aberto, use a aba Controle de pagamentos (peças).")
+        st.caption("Pra pagar uma parcela em aberto ou mudar um vencimento, use a aba Pagar fornecedoras.")
     else:
         st.info("Nenhuma compra registrada ainda.")
 
-    # ---- parcelas e vencimentos de compras em aberto ----
-    em_aberto = compras_em_aberto()
-    if em_aberto:
-        st.subheader("Parcelas e vencimentos")
-        st.caption(
-            "Para compras em aberto: mude vencimentos, valores ou o número de parcelas. "
-            "Parcelas já pagas não mudam."
-        )
-
-        mensagem_parc = st.session_state.pop("reparc_sucesso", None)
-        if mensagem_parc:
-            st.success(mensagem_parc)
-
-        opcoes_reparc = {
-            f"Compra #{c['id']} — {c['fornecedora']} — {brl(c['valor_total'])} — "
-            f"{c['pagas']}/{c['parcelas']} parcela(s) paga(s) — próximo venc. {fmt_data(c['data_vencimento'])}": c
-            for c in em_aberto
+    # ---- editar compra (preço de venda das peças) ----
+    st.divider()
+    st.subheader("Editar compra")
+    st.caption(
+        "Altere o preço de venda das peças de uma compra já registrada. "
+        "Só as peças que ainda estão no estoque podem mudar de preço."
+    )
+    mensagem_edicao = st.session_state.pop("edicao_sucesso", None)
+    if mensagem_edicao:
+        st.success(mensagem_edicao)
+    compras_editaveis = compras_para_editar()
+    if not compras_editaveis:
+        st.info("Nenhuma compra com peças registrada.")
+    else:
+        versao_edicao = st.session_state.setdefault("edicao_versao", 0)
+        opcoes_edicao = {
+            f"Compra #{c['id']} — {c['tipo_compra']} — {c['fornecedora']} — {fmt_data(c['data_aceite'])} — "
+            f"{c['em_estoque']} de {c['pecas']} peça(s) no estoque"
+            + (f" — {c['observacao']}" if c["observacao"] else ""): c
+            for c in compras_editaveis
         }
-        escolha_reparc = st.selectbox("Compra", options=list(opcoes_reparc), key="reparc_sel")
-        compra_reparc = opcoes_reparc[escolha_reparc]
-        parcelas_atuais = parcelas_da_compra(compra_reparc["id"])
-        pagas = [p for p in parcelas_atuais if p["status"] == "pago"]
-        pendentes = [p for p in parcelas_atuais if p["status"] == "pendente"]
-
-        st.dataframe(
-            [
-                {
-                    "Parcela": f"{p['numero']}/{len(parcelas_atuais)}",
-                    "Vencimento": fmt_data(p["data_vencimento"]),
-                    "Valor": brl(p["valor"]),
-                    "Situação": "Paga" if p["status"] == "pago" else "Em aberto",
-                    "Paga em": fmt_data(p["data_pagamento"]) if p["status"] == "pago" else "—",
-                }
-                for p in parcelas_atuais
-            ],
-            use_container_width=True,
-            hide_index=True,
+        escolha_edicao = st.selectbox(
+            "Compra", list(opcoes_edicao), index=None, placeholder="Escolha a compra",
+            key=f"edicao_sel_{versao_edicao}",
         )
-
-        restante = sum((dec(p["valor"]) for p in pendentes), dec(0))
-        st.markdown(f"**Em aberto: {brl(restante)}** em {len(pendentes)} parcela(s).")
-        versao_reparc = st.session_state.setdefault("reparc_versao", 0)
-        data_minima = min([compra_reparc["data_aceite"]] + [p["data_vencimento"] for p in pendentes])
-        novas_parcelas, erro_reparc = editor_parcelas(
-            restante,
-            data_minima,
-            chave=f"reparc_{compra_reparc['id']}_{versao_reparc}",
-            quantidade_padrao=len(pendentes),
-            vencimento_padrao=pendentes[0]["data_vencimento"],
-            iniciais=pendentes,
-            rotulo_quantidade="Parcelas em aberto",
-        )
-        if erro_reparc:
-            st.error(erro_reparc)
-
-        sem_mudanca = not erro_reparc and [
-            (p["data_vencimento"], dec(p["valor"])) for p in novas_parcelas
-        ] == [(p["data_vencimento"], dec(p["valor"])) for p in sorted(pendentes, key=lambda x: (x["data_vencimento"], x["numero"]))]
-        if st.button(
-            "Salvar parcelas", key="reparc_salvar", type="primary",
-            disabled=bool(erro_reparc) or sem_mudanca,
-        ):
-            try:
-                reparcelar(compra_reparc["id"], [p["id"] for p in pendentes], novas_parcelas)
-            except ParcelasAlteradasError as e:
-                st.error(str(e))
-            except Exception as e:
-                st.error(f"Não foi possível salvar. Nada foi gravado. Erro: {e}")
+        if escolha_edicao:
+            compra_edicao = opcoes_edicao[escolha_edicao]
+            pecas_compra = pecas_da_compra(compra_edicao["id"])
+            pecas_estoque = [p for p in pecas_compra if p["status"] == "em_estoque"]
+            vendidas = len(pecas_compra) - len(pecas_estoque)
+            if vendidas:
+                st.caption(f"{vendidas} peça(s) desta compra já foram vendidas e não aparecem aqui.")
+            if not pecas_estoque:
+                st.info("Todas as peças desta compra já foram vendidas.")
             else:
-                st.session_state["reparc_sucesso"] = (
-                    f"Parcelas da compra #{compra_reparc['id']} atualizadas: "
-                    f"{len(novas_parcelas)} parcela(s) em aberto, 1ª vence em "
-                    f"{fmt_data(novas_parcelas[0]['data_vencimento'])}."
-                )
-                st.session_state["reparc_versao"] = versao_reparc + 1
-                st.rerun()
+                busca_edicao = ""
+                if len(pecas_estoque) > 15:
+                    busca_edicao = st.text_input(
+                        "Buscar peça (código ou parte da descrição)",
+                        key=f"edicao_busca_{versao_edicao}_{compra_edicao['id']}",
+                        help="Salve os preços antes de fazer outra busca: a tabela recomeça a cada busca.",
+                    ).strip()
+                if busca_edicao:
+                    termos = busca_edicao.casefold().split()
+                    visiveis = [
+                        p for p in pecas_estoque
+                        if all(
+                            t in f"{p['id']} {p['descricao']} {p['marca'] or ''} {p['tipo_peca'] or ''}".casefold()
+                            for t in termos
+                        )
+                    ]
+                else:
+                    visiveis = pecas_estoque
+                if not visiveis:
+                    st.info("Nenhuma peça encontrada com essa busca.")
+                else:
+                    originais = {p["id"]: p["preco_venda"] for p in visiveis}
+                    tabela_edicao = st.data_editor(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "id": p["id"],
+                                    "descricao": p["descricao"],
+                                    "marca": p["marca"] or "",
+                                    "tamanho": p["tamanho"] or "",
+                                    "preco_custo": float(p["preco_custo"] or 0),
+                                    "preco_venda": float(p["preco_venda"] or 0),
+                                }
+                                for p in visiveis
+                            ]
+                        ),
+                        hide_index=True,
+                        use_container_width=True,
+                        num_rows="fixed",
+                        disabled=["id", "descricao", "marca", "tamanho", "preco_custo"],
+                        key=f"edicao_tabela_{versao_edicao}_{compra_edicao['id']}_{busca_edicao}",
+                        column_config={
+                            "id": st.column_config.NumberColumn("Código", format="%d"),
+                            "descricao": st.column_config.TextColumn("Descrição"),
+                            "marca": st.column_config.TextColumn("Marca"),
+                            "tamanho": st.column_config.TextColumn("Tamanho"),
+                            "preco_custo": st.column_config.NumberColumn("Custo pago (R$)", format="%.2f"),
+                            "preco_venda": st.column_config.NumberColumn(
+                                "Preço de venda (R$)", min_value=0.0, step=1.0, format="%.2f", required=True,
+                            ),
+                        },
+                    )
+                    alteracoes, erro_edicao = [], None
+                    for _, linha in tabela_edicao.iterrows():
+                        pid = int(linha["id"])
+                        if pd.isna(linha["preco_venda"]) or linha["preco_venda"] <= 0:
+                            erro_edicao = f"Peça #{pid}: o preço de venda precisa ser maior que zero."
+                            continue
+                        novo = dec(linha["preco_venda"])
+                        if originais[pid] is None or novo != dec(originais[pid]):
+                            alteracoes.append((pid, originais[pid], novo))
+                    if erro_edicao:
+                        st.error(erro_edicao)
+                    elif alteracoes:
+                        st.caption(
+                            f"{len(alteracoes)} preço(s) alterado(s): "
+                            + " · ".join(
+                                f"#{pid} {brl(antigo or 0)} → {brl(novo)}" for pid, antigo, novo in alteracoes[:8]
+                            )
+                            + (" · …" if len(alteracoes) > 8 else "")
+                        )
+                    if st.button(
+                        "Salvar preços", type="primary", key=f"edicao_salvar_{versao_edicao}",
+                        disabled=bool(erro_edicao) or not alteracoes,
+                    ):
+                        try:
+                            n = atualizar_precos_venda(compra_edicao["id"], alteracoes)
+                        except EdicaoCompraError as e:
+                            st.error(str(e))
+                        except Exception as e:
+                            st.error(f"Não foi possível salvar. Nada foi gravado. Erro: {e}")
+                        else:
+                            st.session_state["edicao_sucesso"] = (
+                                f"Compra #{compra_edicao['id']}: preço de venda de {n} peça(s) atualizado. "
+                                "Se as etiquetas já estavam impressas, gere de novo em Estoque → Gerador de etiquetas."
+                            )
+                            st.session_state["edicao_versao"] = versao_edicao + 1
+                            st.rerun()
 
     # ---- excluir compra (bazar/outros) ou desfazer compra de fornecedora ----
     st.divider()
@@ -1079,6 +1127,93 @@ with aba_avaliacao:
                 )
         else:
             st.info("Nenhuma avaliação registrada ainda.")
+
+# ================================================================
+# Aba: Pagar fornecedoras (pagamento + vencimentos das parcelas)
+# ================================================================
+with aba_pagar:
+    renderizar_pagar_fornecedora()
+
+    # ---- vencimentos e parcelas das compras em aberto ----
+    em_aberto = compras_em_aberto()
+    if em_aberto:
+        st.divider()
+        st.subheader("Alterar vencimento de parcelas")
+        st.caption(
+            "Para compras em aberto: mude vencimentos, valores ou o número de parcelas. "
+            "Parcelas já pagas não mudam."
+        )
+
+        mensagem_parc = st.session_state.pop("reparc_sucesso", None)
+        if mensagem_parc:
+            st.success(mensagem_parc)
+
+        opcoes_reparc = {
+            f"Compra #{c['id']} — {c['fornecedora']} — {brl(c['valor_total'])} — "
+            f"{c['pagas']}/{c['parcelas']} parcela(s) paga(s) — próximo venc. {fmt_data(c['data_vencimento'])}": c
+            for c in em_aberto
+        }
+        escolha_reparc = st.selectbox("Compra", options=list(opcoes_reparc), key="reparc_sel")
+        compra_reparc = opcoes_reparc[escolha_reparc]
+        parcelas_atuais = parcelas_da_compra(compra_reparc["id"])
+        pagas = [p for p in parcelas_atuais if p["status"] == "pago"]
+        pendentes = [p for p in parcelas_atuais if p["status"] == "pendente"]
+
+        st.dataframe(
+            [
+                {
+                    "Parcela": f"{p['numero']}/{len(parcelas_atuais)}",
+                    "Vencimento": fmt_data(p["data_vencimento"]),
+                    "Valor": brl(p["valor"]),
+                    "Situação": "Paga" if p["status"] == "pago" else "Em aberto",
+                    "Paga em": fmt_data(p["data_pagamento"]) if p["status"] == "pago" else "—",
+                }
+                for p in parcelas_atuais
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        restante = sum((dec(p["valor"]) for p in pendentes), dec(0))
+        st.markdown(f"**Em aberto: {brl(restante)}** em {len(pendentes)} parcela(s).")
+        versao_reparc = st.session_state.setdefault("reparc_versao", 0)
+        data_minima = min([compra_reparc["data_aceite"]] + [p["data_vencimento"] for p in pendentes])
+        novas_parcelas, erro_reparc = editor_parcelas(
+            restante,
+            data_minima,
+            # muda quando as parcelas em aberto mudam (ex.: acabou de pagar uma), para o bloco recomeçar
+            chave=f"reparc_{compra_reparc['id']}_{versao_reparc}_"
+                  + "-".join(f"{p['id']}:{p['valor']}" for p in pendentes),
+            quantidade_padrao=len(pendentes),
+            vencimento_padrao=pendentes[0]["data_vencimento"],
+            iniciais=pendentes,
+            rotulo_quantidade="Parcelas em aberto",
+        )
+        if erro_reparc:
+            st.error(erro_reparc)
+
+        sem_mudanca = not erro_reparc and [
+            (p["data_vencimento"], dec(p["valor"])) for p in novas_parcelas
+        ] == [(p["data_vencimento"], dec(p["valor"])) for p in sorted(pendentes, key=lambda x: (x["data_vencimento"], x["numero"]))]
+        if st.button(
+            "Salvar parcelas", key="reparc_salvar", type="primary",
+            disabled=bool(erro_reparc) or sem_mudanca,
+        ):
+            try:
+                reparcelar(compra_reparc["id"], [p["id"] for p in pendentes], novas_parcelas)
+            except ParcelasAlteradasError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Não foi possível salvar. Nada foi gravado. Erro: {e}")
+            else:
+                st.session_state["reparc_sucesso"] = (
+                    f"Parcelas da compra #{compra_reparc['id']} atualizadas: "
+                    f"{len(novas_parcelas)} parcela(s) em aberto, 1ª vence em "
+                    f"{fmt_data(novas_parcelas[0]['data_vencimento'])}."
+                )
+                st.session_state["reparc_versao"] = versao_reparc + 1
+                st.rerun()
+
 
 # ================================================================
 # Aba: Controle de pagamentos (peças)

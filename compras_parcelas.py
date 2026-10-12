@@ -129,7 +129,7 @@ def _impedimentos(consultar, compra_id):
         )
     if pagas:
         motivos.append(
-            f"{pagas} parcela(s) já foram pagas no Controle de pagamentos (peças). "
+            f"{pagas} parcela(s) já foram pagas (aba Pagar fornecedoras). "
             "Apagar a compra deixaria esse pagamento sem compra."
         )
     return motivos

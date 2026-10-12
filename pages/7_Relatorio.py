@@ -317,6 +317,8 @@ st.subheader("Exportar")
 vendas_detalhe = run_query(
     """
     SELECT v.id, v.data_venda, v.cliente, v.forma_pagamento,
+           (SELECT string_agg(vp.forma || ' ' || replace(vp.valor::text, '.', ','), ' + ' ORDER BY vp.id)
+              FROM venda_pagamento vp WHERE vp.venda_id = v.id) AS valor_por_forma,
            CASE v.canal WHEN 'online' THEN 'Online' ELSE 'Loja' END AS canal,
            CASE WHEN v.canal = 'online' THEN CASE WHEN v.entregue THEN 'Entregue' ELSE 'Não entregue' END END AS entrega,
            v.desconto, v.valor_total,

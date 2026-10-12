@@ -10,6 +10,10 @@ from auth import exigir_login, botao_logout
 from controle_vendas import (
     FORMA_FIADO,
     FORMAS_RECEBIMENTO,
+    FORMAS_VENDA,
+    SQL_FORMAS_DA_VENDA,
+    detalhe_formas,
+    rotulo_formas,
     RecebimentoInvalidoError,
     chave_cliente,
     clientes_fiel,
@@ -215,15 +219,59 @@ def _aba_registrar_venda():
     if venda_retroativa:
         col_data.caption(f"Venda de um dia anterior: vai ser registrada em {fmt_data(data_venda)}.")
 
-    col1, col2 = st.columns(2)
-    forma_pagamento = col1.selectbox(
-        "Forma de pagamento",
-        ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Crédito Loja", FORMA_FIADO, "Outro"],
-        key=f"venda_forma_{v}",
-        help=f"\"{FORMA_FIADO}\" é a venda fiado: a cliente paga depois. "
-             "Acompanhe e registre os pagamentos na aba Cliente fiel (fiado).",
+    # ---- valores ----
+    tipos_receita = run_query("SELECT id, nome FROM plano_contas WHERE tipo = 'receita' ORDER BY nome")
+    opcoes_receita = {r["nome"]: r["id"] for r in tipos_receita} if tipos_receita else {}
+    nomes_receita = list(opcoes_receita.keys())
+    indice_padrao = nomes_receita.index("Venda de peças") if "Venda de peças" in nomes_receita else 0
+
+    col3, col4 = st.columns(2)
+    desconto = dec(col3.number_input("Desconto (R$)", min_value=0.0, step=1.0, value=0.0, format="%.2f",
+                                     key=f"venda_desconto_{v}"))
+    if nomes_receita:
+        nome_receita = col4.selectbox("Tipo de receita", options=nomes_receita, index=indice_padrao,
+                                      key=f"venda_receita_{v}")
+        plano_conta_id = opcoes_receita[nome_receita]
+    else:
+        plano_conta_id = None
+
+    subtotal = dec(sum(dec(p) for p in selecionados["preco_vendido"]))
+    valor_total = max(subtotal - desconto, dec(0))
+    if not selecionados.empty:
+        st.metric("Total da venda", brl(valor_total), f"desconto {brl(desconto)}")
+
+    # ---- pagamento (uma forma, ou dividido em duas) ----
+    erro_pagamento = None
+    dividir = st.checkbox(
+        "Dividir em duas formas de pagamento", key=f"venda_dividir_{v}",
+        disabled=valor_total < dec("0.02"),
+        help="Ex.: a cliente paga uma parte no Pix e o resto em dinheiro.",
     )
-    canal_rotulo = col2.radio("Onde foi a venda", ["Na loja", "Online"], horizontal=True, key=f"venda_canal_{v}")
+    ajuda_forma = (f"\"{FORMA_FIADO}\" é a venda fiado: a cliente paga depois. "
+                   "Acompanhe e registre os pagamentos na aba Cliente fiel (fiado).")
+    if dividir and valor_total >= dec("0.02"):
+        col_f1, col_f2 = st.columns(2)
+        forma1 = col_f1.selectbox("Forma 1", FORMAS_VENDA, key=f"venda_forma_{v}", help=ajuda_forma)
+        valor1 = dec(col_f1.number_input(
+            "Valor na forma 1 (R$)", min_value=0.01, max_value=float(valor_total - dec("0.01")),
+            value=float((valor_total / 2).quantize(dec("0.01"))), step=1.0, format="%.2f",
+            key=f"venda_valor1_{v}_{valor_total}",
+        ))
+        forma2 = col_f2.selectbox("Forma 2", FORMAS_VENDA, index=0 if forma1 != FORMAS_VENDA[0] else 1,
+                                  key=f"venda_forma2_{v}")
+        valor2 = valor_total - valor1
+        col_f2.metric("Valor na forma 2 (restante)", brl(valor2))
+        pagamentos = [(forma1, valor1), (forma2, valor2)]
+        if forma1 == forma2:
+            erro_pagamento = "Escolha duas formas de pagamento diferentes."
+    else:
+        forma1 = st.selectbox("Forma de pagamento", FORMAS_VENDA, key=f"venda_forma_{v}", help=ajuda_forma)
+        pagamentos = [(forma1, valor_total)]
+    forma_pagamento = rotulo_formas(pagamentos)
+
+    # ---- canal e cliente ----
+    col1, col2 = st.columns(2)
+    canal_rotulo = col1.radio("Onde foi a venda", ["Na loja", "Online"], horizontal=True, key=f"venda_canal_{v}")
     canal = "online" if canal_rotulo == "Online" else "loja"
     entregue = None
     if canal == "online":
@@ -232,7 +280,7 @@ def _aba_registrar_venda():
             help="Se ainda não foi, a venda fica na aba Entregas online até ser marcada como entregue.",
         )
 
-    fiado = forma_pagamento == FORMA_FIADO
+    fiado = any(forma == FORMA_FIADO for forma, _ in pagamentos)
     if fiado:
         NOVA_CLIENTE = "+ Nova cliente…"
         conhecidas = clientes_fiel()
@@ -249,29 +297,12 @@ def _aba_registrar_venda():
         cliente = st.text_input("Cliente (opcional)", key=f"venda_cliente_{v}")
     cliente = " ".join(str(cliente or "").split())
 
-    tipos_receita = run_query("SELECT id, nome FROM plano_contas WHERE tipo = 'receita' ORDER BY nome")
-    opcoes_receita = {r["nome"]: r["id"] for r in tipos_receita} if tipos_receita else {}
-    nomes_receita = list(opcoes_receita.keys())
-    indice_padrao = nomes_receita.index("Venda de peças") if "Venda de peças" in nomes_receita else 0
-
-    col3, col4 = st.columns(2)
-    desconto = col3.number_input("Desconto (R$)", min_value=0.0, step=1.0, value=0.0)
-    if nomes_receita:
-        nome_receita = col4.selectbox("Tipo de receita", options=nomes_receita, index=indice_padrao)
-        plano_conta_id = opcoes_receita[nome_receita]
-    else:
-        plano_conta_id = None
-
-    if not selecionados.empty:
-        subtotal = selecionados["preco_vendido"].sum()
-        valor_total_preview = max(subtotal - desconto, 0)
-        st.metric("Total da venda", brl(valor_total_preview), f"desconto {brl(desconto)}")
-
+    if erro_pagamento:
+        st.error(erro_pagamento)
     if fiado and not cliente:
         st.info("Informe a cliente para registrar uma venda em Cliente fiel.")
-    if st.button("Registrar venda", type="primary", disabled=selecionados.empty or (fiado and not cliente)):
-        subtotal = round(selecionados["preco_vendido"].sum(), 2)
-        valor_total = round(max(subtotal - desconto, 0), 2)
+    if st.button("Registrar venda", type="primary",
+                 disabled=selecionados.empty or (fiado and not cliente) or bool(erro_pagamento)):
         if venda_retroativa:
             # meio-dia no horário de Brasília: a venda nunca "escorrega" para outro dia
             momento_venda = datetime(data_venda.year, data_venda.month, data_venda.day, 12, 0,
@@ -290,6 +321,11 @@ def _aba_registrar_venda():
                      plano_conta_id, canal, entregue, data_venda if entregue else None),
                     fetch=True,
                 )[0]["id"]
+                for forma, valor in pagamentos:
+                    executar(
+                        "INSERT INTO venda_pagamento (venda_id, forma, valor) VALUES (%s, %s, %s)",
+                        (venda_id, forma, valor),
+                    )
 
                 for _, item in selecionados.iterrows():
                     produto_id = int(item["id"])
@@ -323,6 +359,8 @@ def _aba_registrar_venda():
         extras = []
         if canal == "online":
             extras.append("online, já entregue" if entregue else "online, aguardando entrega")
+        if len(pagamentos) > 1:
+            extras.append(" + ".join(f"{forma} {brl(valor)}" for forma, valor in pagamentos))
         if fiado:
             extras.append(f"fiado para {cliente}")
         st.session_state["venda_sucesso"] = (
@@ -343,7 +381,7 @@ def _vendas_recentes():
     vendas = run_query(
         """
         SELECT v.id, v.data_venda, v.cliente, v.forma_pagamento, v.desconto, v.valor_total,
-               v.canal, v.entregue,
+               v.canal, v.entregue, """ + SQL_FORMAS_DA_VENDA + """ AS formas,
                COALESCE((SELECT SUM(d.valor_devolvido) FROM devolucao d WHERE d.venda_id = v.id), 0) AS devolvido,
                pc.nome AS tipo_receita
         FROM venda v
@@ -358,7 +396,7 @@ def _vendas_recentes():
                     "Venda": f"#{v['id']}",
                     "Data": fmt_data(v["data_venda"]),
                     "Cliente": v["cliente"] or "",
-                    "Forma de pagamento": v["forma_pagamento"] or "",
+                    "Forma de pagamento": detalhe_formas(v["formas"], v["forma_pagamento"] or ""),
                     "Canal": "Online" if v["canal"] == "online" else "Loja",
                     "Entrega": ("Entregue" if v["entregue"] else "Não entregue") if v["canal"] == "online" else "—",
                     "Desconto": brl(v["desconto"]),
@@ -582,7 +620,8 @@ def _devolucoes_recentes():
 
 def _aba_fiado():
     st.caption(
-        f"Vendas com a forma de pagamento \"{FORMA_FIADO}\". Quando a cliente pagar (tudo ou uma parte), "
+        f"Vendas com a forma de pagamento \"{FORMA_FIADO}\" (a venda toda ou só uma parte dela). "
+        "Quando a cliente pagar (tudo ou uma parte), "
         "registre aqui: o valor abate primeiro as compras mais antigas dela."
     )
     mensagem = st.session_state.pop("fiado_sucesso", None)
@@ -645,6 +684,7 @@ def _aba_fiado():
                     "Venda": f"#{v['id']}",
                     "Data": fmt_data(v["data"]),
                     "Valor da venda": brl(v["valor_total"]),
+                    "Em fiado": brl(v["valor_fiado"]),
                     "Já pago / devolvido": brl(dec(v["recebido"]) + dec(v["devolvido"])),
                     "Devia": brl(saldo_por_venda[v["id"]]),
                     "Este pagamento": brl(abatido.get(v["id"], 0)) if abatido.get(v["id"]) else "—",

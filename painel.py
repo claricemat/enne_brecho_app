@@ -380,7 +380,7 @@ def _cartao(coluna, titulo, valor, legenda, ajuda=None):
 
 
 def _aviso_cobrancas(hoje):
-    """Fornecedoras que cobraram e ainda têm parcela em aberto (detalhes no Controle de pagamentos)."""
+    """Fornecedoras que cobraram e ainda têm parcela em aberto (detalhes em Compras)."""
     lista = alertas(hoje)
     if not lista:
         return
@@ -393,7 +393,7 @@ def _aviso_cobrancas(hoje):
     resto = f" e mais {len(lista) - 4}" if len(lista) > 4 else ""
     texto = (
         f"⚠ Fornecedora(s) cobrando pagamento: {', '.join(partes)}{resto}. "
-        "Veja em Compras › Controle de pagamentos (peças)."
+        "Veja em Compras › Controle de pagamentos (peças); para pagar, aba Pagar fornecedoras."
     )
     (st.error if any(a["em_atraso"] for a in lista) else st.warning)(texto)
 

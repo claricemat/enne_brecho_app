@@ -38,16 +38,17 @@
 - `parcelas.py` — parcelamento (divisão em parcelas e o bloco de tela usado em Compras e Despesas)
 - `compras_parcelas.py` — parcelas de uma compra (consulta e reparcelamento), excluir/desfazer compra e excluir avaliação
 - `cobrancas.py` — cobranças das fornecedoras e o alerta de quem está cobrando (com parcela em aberto)
-- `controle_vendas.py` — fiado (cliente fiel: quem deve e pagamentos recebidos) e entregas das vendas online
+- `controle_vendas.py` — formas de pagamento da venda (até duas por venda), fiado (cliente fiel: quem deve e pagamentos recebidos) e entregas das vendas online
 - `devolucoes.py` — devolução de peças vendidas (volta ao estoque e desconta da receita)
 - `pages/4_Despesas.py` — despesas à vista ou parceladas, lançadas numa conta analítica do plano de contas; a despesa paga registra de qual conta/caixa saiu e quando
-- `controle_pagamentos.py` — aba "Controle de pagamentos (peças)" da página de Compras (cartões, tabela filtrável, baixa com desconto e formas de pagamento combinadas)
+- `controle_pagamentos.py` — abas "Pagar fornecedoras" (baixa com desconto e formas de pagamento combinadas; junto com a alteração de vencimentos) e "Controle de pagamentos (peças)" (cartões, tabela filtrável, cobranças) da página de Compras
+- `editar_compra.py` — editar uma compra já registrada (preço de venda das peças que estão no estoque)
 - `exportacao_compras.py` — exporta a tabela de compras em Excel e PDF
 - `pdf_avaliacao.py` — PDF com as duas propostas (A curto prazo / B longo prazo) enviado à fornecedora
 - `prazos_proposta.py` — condições das propostas da avaliação (à vista em até 10 dias; parcelada com nº de parcelas, 1ª em dias úteis e intervalo)
 - `formatacao.py` — valores e datas no padrão brasileiro
 - `db.py` — conexão com o banco; cada consulta usa o horário de Brasília (vendas depois das 21h ficam no dia certo)
-- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_despesa_pagamento.sql` (despesa paga guarda a conta/caixa e a data do pagamento)
+- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_venda_formas.sql` (venda com até duas formas de pagamento)
 
 ## Deploy no Streamlit Community Cloud
 

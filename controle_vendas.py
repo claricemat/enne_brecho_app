@@ -1,24 +1,50 @@
 """Controle das vendas em "Cliente fiel" (fiado) e das entregas das vendas online.
 
-Fiado: a venda é registrada normalmente com a forma de pagamento "Cliente fiel".
+Fiado: a venda é registrada normalmente com a forma de pagamento "Cliente fiel"
+(a venda inteira ou só uma parte dela, quando dividida em duas formas).
 Quando a cliente paga (tudo ou uma parte), o valor abate primeiro as vendas
 mais antigas dela, como num caderninho. Saldo devedor de cada venda =
-valor da venda − devoluções − recebimentos.
+valor em "Cliente fiel" − devoluções − recebimentos (a devolução abate
+primeiro a parte que ainda não foi paga).
 """
 
 import uuid
 from decimal import Decimal
 
 from db import run_query, transacao
+from formatacao import brl
 
 FORMA_FIADO = "Cliente fiel"
 FORMAS_RECEBIMENTO = ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Outro"]
+FORMAS_VENDA = ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Crédito Loja", FORMA_FIADO, "Outro"]
+
+# formas de cada venda, para as consultas: "Pix|50.00;Dinheiro|30.00"
+SQL_FORMAS_DA_VENDA = (
+    "(SELECT string_agg(vp.forma || '|' || vp.valor::text, ';' ORDER BY vp.id) "
+    "FROM venda_pagamento vp WHERE vp.venda_id = v.id)"
+)
 
 CENTAVO = Decimal("0.01")
 
 
 class RecebimentoInvalidoError(Exception):
     """O pagamento não pode ser registrado (valor acima do que a cliente deve...)."""
+
+
+def rotulo_formas(pagamentos):
+    """[(forma, valor), ...] -> "Pix" ou "Pix + Dinheiro" (texto gravado em venda.forma_pagamento)."""
+    return " + ".join(forma for forma, _ in pagamentos)
+
+
+def detalhe_formas(texto, padrao=""):
+    """'Pix|50.00;Dinheiro|30.00' -> 'Pix R$ 50,00 + Dinheiro R$ 30,00'.
+    Com uma forma só, mostra só o nome dela."""
+    if not texto:
+        return padrao
+    partes = [p.split("|", 1) for p in texto.split(";") if "|" in p]
+    if len(partes) == 1:
+        return partes[0][0]
+    return " + ".join(f"{forma} {brl(Decimal(valor))}" for forma, valor in partes)
 
 
 def chave_cliente(nome):
@@ -31,16 +57,19 @@ def chave_cliente(nome):
 # ----------------------------------------------------------------
 _SQL_VENDAS_FIADO = """
     SELECT v.id, v.data_venda::date AS data, v.cliente, v.valor_total, v.canal,
+           fp.valor AS valor_fiado,
            COALESCE((SELECT SUM(d.valor_devolvido) FROM devolucao d WHERE d.venda_id = v.id), 0) AS devolvido,
            COALESCE((SELECT SUM(r.valor) FROM venda_recebimento r WHERE r.venda_id = v.id), 0) AS recebido
     FROM venda v
-    WHERE v.forma_pagamento = %s
+    JOIN (SELECT venda_id, SUM(valor) AS valor FROM venda_pagamento
+          WHERE forma = %s GROUP BY venda_id) fp ON fp.venda_id = v.id
 """
 
 
 def _com_saldo(linhas):
     for l in linhas:
-        l["saldo"] = Decimal(l["valor_total"]) - Decimal(l["devolvido"]) - Decimal(l["recebido"])
+        saldo = Decimal(l["valor_fiado"]) - Decimal(l["devolvido"]) - Decimal(l["recebido"])
+        l["saldo"] = max(saldo, Decimal("0"))
     return linhas
 
 
@@ -53,7 +82,9 @@ def vendas_fiado_em_aberto():
 def clientes_fiel():
     """Nomes das clientes que já compraram em fiado (a grafia mais recente de cada uma)."""
     linhas = run_query(
-        "SELECT cliente FROM venda WHERE forma_pagamento = %s AND cliente IS NOT NULL ORDER BY data_venda DESC, id DESC",
+        "SELECT cliente FROM venda v WHERE cliente IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM venda_pagamento p WHERE p.venda_id = v.id AND p.forma = %s) "
+        "ORDER BY data_venda DESC, id DESC",
         (FORMA_FIADO,),
     )
     nomes = {}
@@ -100,7 +131,7 @@ def registrar_recebimento(cliente, valor, data, forma, observacao, usuario):
     with transacao() as executar:
         # trava as vendas em fiado (a outra pessoa pode estar registrando um pagamento junto)
         todas = _com_saldo(
-            executar(_SQL_VENDAS_FIADO + " ORDER BY v.data_venda, v.id FOR UPDATE", (FORMA_FIADO,), fetch=True)
+            executar(_SQL_VENDAS_FIADO + " ORDER BY v.data_venda, v.id FOR UPDATE OF v", (FORMA_FIADO,), fetch=True)
         )
         vendas = [v for v in todas if v["saldo"] > 0 and chave_cliente(v["cliente"]) == alvo]
         devendo = sum((v["saldo"] for v in vendas), Decimal("0"))
