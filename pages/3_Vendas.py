@@ -21,6 +21,7 @@ from controle_vendas import (
     distribuir_pagamento,
     excluir_recebimento,
     marcar_entregues,
+    pecas_fiado_da_cliente,
     recebido_no_periodo,
     recebimentos_recentes,
     registrar_recebimento,
@@ -618,6 +619,27 @@ def _devolucoes_recentes():
                     st.rerun()
 
 
+def _tabela_pecas_fiado(itens):
+    st.dataframe(
+        [
+            {
+                "Venda": f"#{i['venda_id']}" + (" (parte em fiado)" if i["fiado_parcial"] else ""),
+                "Data": fmt_data(i["data"]),
+                "Código": i["produto_id"],
+                "Peça": i["descricao"],
+                "Marca": i["marca"] or "",
+                "Tamanho": i["tamanho"] or "",
+                "Preço": brl(i["preco_vendido"] or 0),
+                "Situação": "Devolvida" if i["devolvida"] else ("Em aberto" if i["em_aberto"] else "Quitada"),
+            }
+            for i in itens
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config={"Código": st.column_config.NumberColumn("Código", format="%d")},
+    )
+
+
 def _aba_fiado():
     st.caption(
         f"Vendas com a forma de pagamento \"{FORMA_FIADO}\" (a venda toda ou só uma parte dela). "
@@ -695,6 +717,11 @@ def _aba_fiado():
             use_container_width=True,
             hide_index=True,
         )
+        pecas_abertas = [i for i in pecas_fiado_da_cliente(g["cliente"]) if i["em_aberto"]]
+        if pecas_abertas:
+            st.markdown(f"**Peças que {g['cliente']} levou nessas vendas**")
+            _tabela_pecas_fiado(pecas_abertas)
+
         if st.button("Registrar pagamento", type="primary", disabled=valor <= 0, key=f"fiado_registrar_{versao}"):
             try:
                 feitas = registrar_recebimento(
@@ -711,6 +738,27 @@ def _aba_fiado():
                 )
                 st.session_state["fiado_versao"] = versao + 1
                 st.rerun()
+
+    # ---- histórico de peças compradas no fiado (inclusive vendas já quitadas) ----
+    todas_clientes = clientes_fiel()
+    if todas_clientes:
+        st.divider()
+        st.subheader("Peças compradas no fiado")
+        st.caption("Todas as peças que a cliente levou no fiado, das vendas em aberto e das já quitadas.")
+        cliente_hist = st.selectbox("Cliente", todas_clientes, index=None, placeholder="Escolha a cliente",
+                                    key="fiado_hist_cliente")
+        if cliente_hist:
+            itens_hist = pecas_fiado_da_cliente(cliente_hist)
+            if not itens_hist:
+                st.info("Nenhuma peça encontrada.")
+            else:
+                ativas = [i for i in itens_hist if not i["devolvida"]]
+                st.caption(
+                    f"{len(ativas)} peça(s), {brl(sum(dec(i['preco_vendido'] or 0) for i in ativas))} "
+                    f"em {len({i['venda_id'] for i in itens_hist})} venda(s)"
+                    + (f"; {len(itens_hist) - len(ativas)} devolvida(s)." if len(ativas) < len(itens_hist) else ".")
+                )
+                _tabela_pecas_fiado(itens_hist)
 
     recentes = recebimentos_recentes()
     if recentes:

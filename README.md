@@ -48,7 +48,7 @@
 - `prazos_proposta.py` — condições das propostas da avaliação (à vista em até 10 dias; parcelada com nº de parcelas, 1ª em dias úteis e intervalo)
 - `formatacao.py` — valores e datas no padrão brasileiro
 - `db.py` — conexão com o banco; cada consulta usa o horário de Brasília (vendas depois das 21h ficam no dia certo)
-- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_venda_formas.sql` (venda com até duas formas de pagamento)
+- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_revenda_devolvida.sql` (peça devolvida pode ser vendida de novo)
 
 ## Deploy no Streamlit Community Cloud
 

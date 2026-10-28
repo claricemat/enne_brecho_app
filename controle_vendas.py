@@ -93,6 +93,36 @@ def clientes_fiel():
     return sorted(nomes.values(), key=str.casefold)
 
 
+def pecas_fiado_da_cliente(cliente):
+    """Peças das vendas em fiado da cliente (a venda toda ou só a parte em fiado),
+    com a situação de cada venda (em aberto / quitada) e se a peça foi devolvida."""
+    alvo = chave_cliente(cliente)
+    vendas = [v for v in _com_saldo(run_query(_SQL_VENDAS_FIADO + " ORDER BY v.data_venda, v.id", (FORMA_FIADO,)))
+              if chave_cliente(v["cliente"]) == alvo]
+    if not vendas:
+        return []
+    por_venda = {v["id"]: v for v in vendas}
+    itens = run_query(
+        """
+        SELECT iv.venda_id, iv.produto_id, p.descricao, p.marca, p.tamanho, iv.preco_vendido,
+               (di.id IS NOT NULL) AS devolvida
+        FROM item_venda iv
+        JOIN produto p ON p.id = iv.produto_id
+        LEFT JOIN devolucao_item di ON di.item_venda_id = iv.id
+        WHERE iv.venda_id = ANY(%s)
+        ORDER BY iv.venda_id, iv.id
+        """,
+        (list(por_venda),),
+    )
+    for i in itens:
+        v = por_venda[i["venda_id"]]
+        i["data"] = v["data"]
+        i["em_aberto"] = v["saldo"] > 0
+        i["fiado_parcial"] = Decimal(v["valor_fiado"]) < Decimal(v["valor_total"])
+    itens.sort(key=lambda i: (por_venda[i["venda_id"]]["data"], i["venda_id"]))
+    return itens
+
+
 def resumo_por_cliente(em_aberto):
     """Agrupa as vendas em aberto por cliente."""
     grupos = {}
