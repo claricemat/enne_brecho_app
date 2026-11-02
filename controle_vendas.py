@@ -151,7 +151,7 @@ def distribuir_pagamento(vendas_da_cliente, valor):
     return partes
 
 
-def registrar_recebimento(cliente, valor, data, forma, observacao, usuario):
+def registrar_recebimento(cliente, valor, data, forma, observacao, usuario, conta_financeira_id=None):
     """Registra um pagamento da cliente, abatendo as vendas mais antigas primeiro.
     Tudo numa transação. Retorna [(venda_id, valor abatido)]."""
     valor = Decimal(str(valor)).quantize(CENTAVO)
@@ -175,9 +175,9 @@ def registrar_recebimento(cliente, valor, data, forma, observacao, usuario):
         partes = distribuir_pagamento(vendas, valor)
         for venda_id, parte in partes:
             executar(
-                "INSERT INTO venda_recebimento (venda_id, data, valor, forma, lote, observacao, criado_por) "
-                "VALUES (%s, %s, %s, %s, %s::uuid, %s, %s)",
-                (venda_id, data, parte, forma, lote, observacao or None, usuario),
+                "INSERT INTO venda_recebimento (venda_id, data, valor, forma, lote, observacao, criado_por, "
+                "conta_financeira_id) VALUES (%s, %s, %s, %s, %s::uuid, %s, %s, %s)",
+                (venda_id, data, parte, forma, lote, observacao or None, usuario, conta_financeira_id),
             )
     return partes
 

@@ -29,11 +29,12 @@
 - `pages/3_Vendas.py` — registrar vendas (busca por código/ID, descrição ou marca; as peças marcadas ficam numa sacola que não se perde ao pesquisar outra peça) e abas "Cliente fiel (fiado)", "Entregas online" e "Devolução de peças"
 - `pages/5_Estoque.py` — estoque + sub-aba "Gerador de etiquetas"
 - `pages/6_Cadastros.py` — tipos de peça, tipos de compra, plano de contas (Grupo › Subgrupo › Analítico) e contas/caixa
-- `pages/8_Financeiro.py` — conciliação bancária, importação de extrato OFX e resumo por plano de contas
+- `pages/8_Financeiro.py` — conciliação bancária (pré-conciliada com vendas, recebimentos do fiado, despesas e pagamentos de compras), importação de extrato OFX, caixa e lançamentos manuais, balancete e configurações (conta padrão por forma de pagamento, saldo inicial, lançamentos sem conta)
 - `etiquetas.py` — PDF das etiquetas 4 × 4 cm (uma por página ou grade em A4)
 - `plano.py` — funções do plano de contas (grupos, subgrupos, rótulos)
 - `ofx_parser.py` — leitor de arquivos OFX (versões 1 e 2)
-- `financeiro.py` — importação do extrato e conciliação no banco
+- `financeiro.py` — importação do extrato, conciliação automática com os movimentos do sistema (view `movimento_financeiro`), lançamentos manuais, saldos e balancete
+- `contas_ui.py` — campo "em qual conta/caixa entrou o dinheiro" usado em Vendas
 - `pagamento_parcial.py` — pagar só uma parte de uma despesa ou de uma parcela de compra (o restante continua em aberto, com o mesmo vencimento ou outro, se escolhido)
 - `parcelas.py` — parcelamento (divisão em parcelas e o bloco de tela usado em Compras e Despesas)
 - `compras_parcelas.py` — parcelas de uma compra (consulta e reparcelamento), excluir/desfazer compra e excluir avaliação
@@ -48,7 +49,7 @@
 - `prazos_proposta.py` — condições das propostas da avaliação (à vista em até 10 dias; parcelada com nº de parcelas, 1ª em dias úteis e intervalo)
 - `formatacao.py` — valores e datas no padrão brasileiro
 - `db.py` — conexão com o banco; cada consulta usa o horário de Brasília (vendas depois das 21h ficam no dia certo)
-- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_revenda_devolvida.sql` (peça devolvida pode ser vendida de novo)
+- `migracao_*.sql` — rodar no SQL Editor do Supabase, na ordem em que foram criadas. **Sempre rode o `.sql` novo antes de subir o código novo.** O mais recente é `migracao_financeiro_integrado.sql` (financeiro ligado a vendas, despesas e compras; caixa e balancete)
 
 ## Deploy no Streamlit Community Cloud
 

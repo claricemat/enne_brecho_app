@@ -69,7 +69,7 @@ def valores_sugeridos(itens_da_venda, valor_total_venda):
     }
 
 
-def registrar_devolucao(venda_id, itens, data, forma_reembolso, motivo, usuario):
+def registrar_devolucao(venda_id, itens, data, forma_reembolso, motivo, usuario, conta_financeira_id=None):
     """itens: lista de (item_venda_id, valor_devolvido). Tudo numa transação.
     Retorna o id da devolução."""
     ids = [i for i, _ in itens]
@@ -120,10 +120,12 @@ def registrar_devolucao(venda_id, itens, data, forma_reembolso, motivo, usuario)
 
         devolucao_id = executar(
             """
-            INSERT INTO devolucao (venda_id, data, valor_devolvido, forma_reembolso, motivo, criado_por)
-            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            INSERT INTO devolucao (venda_id, data, valor_devolvido, forma_reembolso, motivo, criado_por,
+                                   conta_financeira_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
             """,
-            (venda_id, data, valor_total, forma_reembolso, motivo or None, usuario),
+            (venda_id, data, valor_total, forma_reembolso, motivo or None, usuario,
+             conta_financeira_id if valor_total > 0 else None),
             fetch=True,
         )[0]["id"]
 

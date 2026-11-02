@@ -29,6 +29,7 @@ from controle_vendas import (
     vendas_fiado_em_aberto,
     vendas_online,
 )
+from financeiro import FORMA_PADRAO_REEMBOLSO
 from devolucoes import (
     FORMAS_REEMBOLSO,
     DevolucaoInvalidaError,
@@ -39,6 +40,7 @@ from devolucoes import (
     registrar_devolucao,
     valores_sugeridos,
 )
+from contas_ui import carregar_contas_e_padroes, seletor_conta
 from formatacao import brl, fmt_data, hoje_brasil
 from parcelas import dec
 
@@ -241,8 +243,9 @@ def _aba_registrar_venda():
     if not selecionados.empty:
         st.metric("Total da venda", brl(valor_total), f"desconto {brl(desconto)}")
 
-    # ---- pagamento (uma forma, ou dividido em duas) ----
+    # ---- pagamento (uma forma, ou dividido em duas), com a conta/caixa onde o dinheiro entrou ----
     erro_pagamento = None
+    contas_fin, padroes_fin = carregar_contas_e_padroes()
     dividir = st.checkbox(
         "Dividir em duas formas de pagamento", key=f"venda_dividir_{v}",
         disabled=valor_total < dec("0.02"),
@@ -262,12 +265,20 @@ def _aba_registrar_venda():
                                   key=f"venda_forma2_{v}")
         valor2 = valor_total - valor1
         col_f2.metric("Valor na forma 2 (restante)", brl(valor2))
+        conta1, erro1 = seletor_conta(forma1, contas_fin, padroes_fin, f"venda_conta1_{v}", coluna=col_f1)
+        conta2, erro2 = seletor_conta(forma2, contas_fin, padroes_fin, f"venda_conta2_{v}", coluna=col_f2)
         pagamentos = [(forma1, valor1), (forma2, valor2)]
+        contas_pagamento = [conta1, conta2]
         if forma1 == forma2:
             erro_pagamento = "Escolha duas formas de pagamento diferentes."
+        else:
+            erro_pagamento = erro1 or erro2
     else:
-        forma1 = st.selectbox("Forma de pagamento", FORMAS_VENDA, key=f"venda_forma_{v}", help=ajuda_forma)
+        col_f1, col_f2 = st.columns(2)
+        forma1 = col_f1.selectbox("Forma de pagamento", FORMAS_VENDA, key=f"venda_forma_{v}", help=ajuda_forma)
+        conta1, erro_pagamento = seletor_conta(forma1, contas_fin, padroes_fin, f"venda_conta1_{v}", coluna=col_f2)
         pagamentos = [(forma1, valor_total)]
+        contas_pagamento = [conta1]
     forma_pagamento = rotulo_formas(pagamentos)
 
     # ---- canal e cliente ----
@@ -322,10 +333,11 @@ def _aba_registrar_venda():
                      plano_conta_id, canal, entregue, data_venda if entregue else None),
                     fetch=True,
                 )[0]["id"]
-                for forma, valor in pagamentos:
+                for (forma, valor), conta_id in zip(pagamentos, contas_pagamento):
                     executar(
-                        "INSERT INTO venda_pagamento (venda_id, forma, valor) VALUES (%s, %s, %s)",
-                        (venda_id, forma, valor),
+                        "INSERT INTO venda_pagamento (venda_id, forma, valor, conta_financeira_id) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (venda_id, forma, valor, conta_id),
                     )
 
                 for _, item in selecionados.iterrows():
@@ -536,6 +548,13 @@ def _formulario_devolucao(venda_id, itens_venda, versao, hoje):
         format="DD/MM/YYYY", key=f"dev_data_{versao}_{venda_id}",
     )
     forma = col2.selectbox("Como o valor foi devolvido", FORMAS_REEMBOLSO, key=f"dev_forma_{versao}_{venda_id}")
+    conta_reembolso, erro_conta = None, None
+    if forma in FORMA_PADRAO_REEMBOLSO:
+        contas_fin, padroes_fin = carregar_contas_e_padroes()
+        conta_reembolso, erro_conta = seletor_conta(
+            FORMA_PADRAO_REEMBOLSO[forma], contas_fin, padroes_fin, f"dev_conta_{versao}_{venda_id}",
+            rotulo="Saiu de", coluna=col2,
+        )
     motivo = st.text_input("Motivo (opcional)", placeholder="ex: não serviu, defeito", key=f"dev_motivo_{versao}_{venda_id}")
 
     total = sum((dec(v) for v in marcadas["valor_devolver"].fillna(0)), dec(0))
@@ -550,6 +569,8 @@ def _formulario_devolucao(venda_id, itens_venda, versao, hoje):
         erro = "Informe o valor devolvido de cada peça marcada (pode ser 0)."
     elif total > limite:
         erro = f"O valor devolvido ({brl(total)}) passa do que ainda pode ser devolvido desta venda ({brl(limite)})."
+    elif erro_conta and total > 0:
+        erro = erro_conta.replace("entrou o pagamento em", "saiu o reembolso em")
     if erro:
         st.error(erro)
 
@@ -562,6 +583,7 @@ def _formulario_devolucao(venda_id, itens_venda, versao, hoje):
                 venda_id,
                 [(int(r["item_venda_id"]), dec(r["valor_devolver"])) for _, r in marcadas.iterrows()],
                 data_devolucao, forma, motivo.strip(), st.session_state.get("usuario"),
+                conta_financeira_id=conta_reembolso if total > 0 else None,
             )
         except DevolucaoInvalidaError as e:
             st.error(str(e))
@@ -695,7 +717,10 @@ def _aba_fiado():
         data_pagto = col2.date_input("Data do pagamento", value=hoje, max_value=hoje, format="DD/MM/YYYY",
                                      key=f"fiado_data_{versao}")
         forma = col3.selectbox("Forma", FORMAS_RECEBIMENTO, key=f"fiado_forma_{versao}")
-        obs = st.text_input("Observação (opcional)", key=f"fiado_obs_{versao}")
+        contas_fin, padroes_fin = carregar_contas_e_padroes()
+        col_conta, col_obs = st.columns(2)
+        conta_receb, erro_conta = seletor_conta(forma, contas_fin, padroes_fin, f"fiado_conta_{versao}", coluna=col_conta)
+        obs = col_obs.text_input("Observação (opcional)", key=f"fiado_obs_{versao}")
 
         partes = distribuir_pagamento(vendas_cliente, valor) if valor > 0 else []
         saldo_por_venda = {v["id"]: v["saldo"] for v in vendas_cliente}
@@ -722,10 +747,14 @@ def _aba_fiado():
             st.markdown(f"**Peças que {g['cliente']} levou nessas vendas**")
             _tabela_pecas_fiado(pecas_abertas)
 
-        if st.button("Registrar pagamento", type="primary", disabled=valor <= 0, key=f"fiado_registrar_{versao}"):
+        if erro_conta and valor > 0:
+            st.info(erro_conta)
+        if st.button("Registrar pagamento", type="primary", disabled=valor <= 0 or bool(erro_conta),
+                     key=f"fiado_registrar_{versao}"):
             try:
                 feitas = registrar_recebimento(
-                    g["cliente"], valor, data_pagto, forma, obs.strip(), st.session_state.get("usuario")
+                    g["cliente"], valor, data_pagto, forma, obs.strip(), st.session_state.get("usuario"),
+                    conta_financeira_id=conta_receb,
                 )
             except RecebimentoInvalidoError as e:
                 st.error(str(e))
