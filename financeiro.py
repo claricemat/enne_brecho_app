@@ -377,38 +377,107 @@ def _janela(mov):
     return JANELA_CARTAO if mov["origem"] in ("venda", "fiado") and forma.startswith("Cartão") else JANELA_PADRAO
 
 
-def sugerir_vinculos(lancamentos):
-    """Casa cada lançamento pendente do extrato com um movimento do sistema de
-    mesmo valor, na mesma conta e com data próxima. Cada movimento só é usado
-    uma vez; os pares mais próximos na data têm preferência.
-    Retorna {extrato_id: movimento}."""
-    if not lancamentos:
-        return {}
-    contas = {l["conta_financeira_id"] for l in lancamentos}
-    inicio = min(l["data"] for l in lancamentos) - timedelta(days=JANELA_CARTAO[1])
-    fim = max(l["data"] for l in lancamentos) + timedelta(days=-JANELA_PADRAO[0])
-    movimentos = movimentos_livres(contas, inicio, fim)
+JANELA_POSSIVEL = 20   # dias, para "possível par" (data mais longe ou outra conta)
 
-    por_chave = {}
-    for m in movimentos:
-        por_chave.setdefault((m["conta_financeira_id"], _dec(m["valor"])), []).append(m)
 
-    pares = []
-    for l in lancamentos:
-        for m in por_chave.get((l["conta_financeira_id"], _dec(l["valor"])), []):
-            dias = (l["data"] - m["data"]).days
-            menor, maior = _janela(m)
-            if menor <= dias <= maior:
-                pares.append((abs(dias), l["id"], m["origem"], m["origem_id"], m))
-    pares.sort(key=lambda p: (p[0], p[1], p[2], p[3]))
-
+def _parear(candidatos):
+    """candidatos: [(prioridade, extrato_id, mov)]. Cada extrato e cada movimento
+    entram em um par só; menor prioridade primeiro."""
+    candidatos.sort(key=lambda p: (p[0], p[1], p[2]["origem"], p[2]["origem_id"]))
     usados_extrato, usados_mov, resultado = set(), set(), {}
-    for _, extrato_id, origem, origem_id, m in pares:
-        if extrato_id in usados_extrato or (origem, origem_id) in usados_mov:
+    for _, extrato_id, m in candidatos:
+        chave = (m["origem"], m["origem_id"])
+        if extrato_id in usados_extrato or chave in usados_mov:
             continue
         usados_extrato.add(extrato_id)
-        usados_mov.add((origem, origem_id))
+        usados_mov.add(chave)
         resultado[extrato_id] = m
+    return resultado
+
+
+def sugerir_vinculos(lancamentos, com_possiveis=False):
+    """Casa cada lançamento pendente do extrato com um movimento do sistema de
+    mesmo valor. Cada movimento só é usado uma vez.
+
+    - encontrados: mesma conta e data próxima (janela padrão / cartão) — confiáveis;
+    - possíveis (com_possiveis=True): mesmo valor, mas a data está mais longe (até
+      JANELA_POSSIVEL dias) ou a conta registrada é outra — para conferir.
+    Retorna {extrato_id: movimento}, ou ({...encontrados}, {...possíveis})."""
+    if not lancamentos:
+        return ({}, {}) if com_possiveis else {}
+    inicio = min(l["data"] for l in lancamentos) - timedelta(days=max(JANELA_CARTAO[1], JANELA_POSSIVEL))
+    fim = max(l["data"] for l in lancamentos) + timedelta(days=JANELA_POSSIVEL)
+    # possíveis em outra conta: só contas bancárias (o que foi registrado no caixa não passa pelo banco)
+    contas = ({c["id"] for c in contas_bancarias()} | {l["conta_financeira_id"] for l in lancamentos}
+              if com_possiveis else {l["conta_financeira_id"] for l in lancamentos})
+    por_valor = {}
+    for m in movimentos_livres(contas, inicio, fim):
+        por_valor.setdefault(_dec(m["valor"]), []).append(m)
+
+    fortes, fracos = [], []
+    for l in lancamentos:
+        for m in por_valor.get(_dec(l["valor"]), []):
+            dias = (l["data"] - m["data"]).days
+            menor, maior = _janela(m)
+            mesma_conta = m["conta_financeira_id"] == l["conta_financeira_id"]
+            na_janela = menor <= dias <= maior
+            if mesma_conta and na_janela:
+                fortes.append((abs(dias), l["id"], m))
+            elif (mesma_conta and abs(dias) <= JANELA_POSSIVEL) or (not mesma_conta and na_janela):
+                # mesma conta com a data mais longe, ou outra conta com a data próxima
+                fracos.append(((0 if mesma_conta else 100) + abs(dias), l["id"], m))
+    encontrados = _parear(fortes)
+    if not com_possiveis:
+        return encontrados
+    usados = {(m["origem"], m["origem_id"]) for m in encontrados.values()}
+    possiveis = _parear([f for f in fracos if f[1] not in encontrados
+                         and (f[2]["origem"], f[2]["origem_id"]) not in usados])
+    return encontrados, possiveis
+
+
+def pares_no_extrato(movimentos):
+    """Para movimentos do sistema ainda soltos: o lançamento do extrato de mesmo
+    valor mais provável (mesma conta primeiro, depois a data mais próxima, até
+    JANELA_POSSIVEL dias), que ainda não esteja ligado a outro movimento do sistema.
+    Inclui os já conciliados direto no plano — é o caso de lançamento contado em dobro.
+    Retorna {(origem, origem_id): lançamento do extrato}."""
+    if not movimentos:
+        return {}
+    inicio = min(m["data"] for m in movimentos) - timedelta(days=JANELA_POSSIVEL)
+    fim = max(m["data"] for m in movimentos) + timedelta(days=max(JANELA_POSSIVEL, JANELA_CARTAO[1]))
+    linhas = run_query(
+        """
+        SELECT e.id, e.conta_financeira_id, cf.nome AS conta, e.data, e.valor, e.descricao,
+               e.plano_conta_id, e.conciliado_em
+        FROM extrato_lancamento e
+        JOIN conta_financeira cf ON cf.id = e.conta_financeira_id
+        WHERE e.data BETWEEN %s AND %s
+          AND NOT EXISTS (SELECT 1 FROM conciliacao_vinculo c WHERE c.extrato_lancamento_id = e.id)
+        """,
+        (inicio, fim),
+    )
+    por_valor = {}
+    for l in linhas:
+        por_valor.setdefault(_dec(l["valor"]), []).append(l)
+    candidatos = []
+    for m in movimentos:
+        for l in por_valor.get(_dec(m["valor"]), []):
+            dias = (l["data"] - m["data"]).days
+            menor, maior = _janela(m)
+            mesma_conta = l["conta_financeira_id"] == m["conta_financeira_id"]
+            na_janela = menor <= dias <= maior
+            if not ((mesma_conta and (na_janela or abs(dias) <= JANELA_POSSIVEL)) or (not mesma_conta and na_janela)):
+                continue
+            prioridade = (0 if mesma_conta else 100) + abs(dias)
+            candidatos.append((prioridade, m, l))
+    candidatos.sort(key=lambda c: (c[0], c[2]["id"]))
+    usados_ext, resultado = set(), {}
+    for _, m, l in candidatos:
+        chave = (m["origem"], m["origem_id"])
+        if chave in resultado or l["id"] in usados_ext:
+            continue
+        usados_ext.add(l["id"])
+        resultado[chave] = l
     return resultado
 
 
@@ -422,8 +491,25 @@ def movimentos_sem_extrato(conta_id, inicio, fim):
 # ----------------------------------------------------------------
 # Conciliação
 # ----------------------------------------------------------------
+_SQL_CONTA_DO_MOVIMENTO = {
+    "venda": "UPDATE venda_pagamento SET conta_financeira_id = %s WHERE id = %s",
+    "fiado": "UPDATE venda_recebimento SET conta_financeira_id = %s WHERE id = %s",
+    "despesa": "UPDATE despesa SET conta_financeira_id = %s WHERE id = %s",
+    "fornecedora": "UPDATE baixa_compra_forma SET conta_financeira_id = %s WHERE id = %s AND forma = 'conta'",
+    "devolucao": "UPDATE devolucao SET conta_financeira_id = %s WHERE id = %s",
+    "manual": "UPDATE movimento_manual SET conta_financeira_id = %s WHERE id = %s",
+}
+
+
 def _gravar_vinculos(executar, extrato_id, movimentos, usuario):
+    """Liga o lançamento do extrato aos movimentos. O extrato é a verdade: se o
+    movimento foi registrado em outra conta, a conta dele é corrigida para a do extrato."""
+    conta_extrato = executar(
+        "SELECT conta_financeira_id FROM extrato_lancamento WHERE id = %s", (extrato_id,), fetch=True
+    )[0]["conta_financeira_id"]
     for origem, origem_id, valor in movimentos:
+        executar(_SQL_CONTA_DO_MOVIMENTO[origem] + " AND conta_financeira_id IS DISTINCT FROM %s",
+                 (conta_extrato, origem_id, conta_extrato))
         executar(
             "INSERT INTO conciliacao_vinculo (extrato_lancamento_id, origem, origem_id, valor) VALUES (%s, %s, %s, %s)",
             (extrato_id, origem, origem_id, _dec(valor)),
@@ -483,6 +569,29 @@ def conciliar_lote(itens, usuario):
                 )
             feitos += 1
     return feitos, pulados
+
+
+def ligar_ao_extrato(pares, usuario):
+    """pares: [(extrato_id, origem, origem_id, valor)]. Liga cada movimento solto do
+    sistema ao lançamento do extrato — inclusive os que tinham sido conciliados direto
+    numa conta do plano (a classificação direta é trocada pela ligação, o que tira a
+    duplicidade do balancete). Retorna (ligados, pulados)."""
+    ligados = pulados = 0
+    with transacao() as executar:
+        for extrato_id, origem, origem_id, valor in pares:
+            extrato = executar(
+                "SELECT id FROM extrato_lancamento e WHERE id = %s AND NOT EXISTS "
+                "(SELECT 1 FROM conciliacao_vinculo c WHERE c.extrato_lancamento_id = e.id) FOR UPDATE",
+                (extrato_id,), fetch=True,
+            )
+            ja = executar("SELECT 1 FROM conciliacao_vinculo WHERE origem = %s AND origem_id = %s",
+                          (origem, origem_id), fetch=True)
+            if not extrato or ja:
+                pulados += 1
+                continue
+            _gravar_vinculos(executar, extrato_id, [(origem, origem_id, valor)], usuario)
+            ligados += 1
+    return ligados, pulados
 
 
 def conciliar_com_diferenca(extrato_id, movimentos, plano_ajuste_id, usuario):

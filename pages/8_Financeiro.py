@@ -28,6 +28,8 @@ from financeiro import (
     fitids_ja_importados,
     importar_lancamentos,
     lancamentos_sem_conta,
+    ligar_ao_extrato,
+    pares_no_extrato,
     limpar_vinculos_orfaos,
     movimentos_da_conta,
     movimentos_livres,
@@ -73,6 +75,7 @@ todas_contas = contas_financeiras()
 plano = carregar_contas()
 por_rotulo_plano = {rotulo_conta(c): c for c in plano}
 rotulo_por_id_plano = {c["id"]: rotulo_conta(c) for c in plano}
+nome_conta_por_id = {c["id"]: c["nome"] for c in todas_contas}
 
 mensagem = st.session_state.pop("fin_sucesso", None)
 if mensagem:
@@ -129,14 +132,29 @@ def _marcar_por_descricao():
 
 def _editor_pendentes(linhas, conta_id):
     versao = st.session_state["fin_versao"]
-    sistema = sugerir_vinculos(linhas)
+    encontrados, possiveis = sugerir_vinculos(linhas, com_possiveis=True)
+    sistema = {**possiveis, **encontrados}
     por_descricao = sugestoes_por_descricao()
     marcar_desc = st.session_state.get("fin_marcar_desc", False)
 
     registros = []
     for l in linhas:
-        mov = sistema.get(l["id"])
-        plano_sug = None if mov else rotulo_por_id_plano.get(por_descricao.get(normalizar_descricao(l["descricao"])))
+        mov = encontrados.get(l["id"])
+        possivel = possiveis.get(l["id"])
+        plano_sug = None
+        if mov:
+            texto = _texto_movimento(mov)
+        elif possivel:
+            diferencas = []
+            if possivel["conta_financeira_id"] != l["conta_financeira_id"]:
+                diferencas.append(f"registrado em {nome_conta_por_id.get(possivel['conta_financeira_id'], '?')}")
+            dias = (l["data"] - possivel["data"]).days
+            if dias:
+                diferencas.append(f"{abs(dias)} dia(s) {'antes' if dias > 0 else 'depois'} do extrato")
+            texto = f"⚠ Possível: {_texto_movimento(possivel)} — {', '.join(diferencas)}"
+        else:
+            texto = ""
+            plano_sug = rotulo_por_id_plano.get(por_descricao.get(normalizar_descricao(l["descricao"])))
         registros.append(
             {
                 "id": l["id"],
@@ -145,23 +163,27 @@ def _editor_pendentes(linhas, conta_id):
                 "conta": l["conta"],
                 "descricao": l["descricao"] or "",
                 "valor": float(l["valor"]),
-                "sistema": _texto_movimento(mov) if mov else "",
+                "sistema": texto,
                 "plano": plano_sug,
             }
         )
-    n_sistema = sum(1 for r in registros if r["sistema"])
+    n_sistema = len(encontrados)
+    n_possiveis = len(possiveis)
     n_desc = sum(1 for r in registros if r["plano"])
     pre = n_sistema + n_desc
     st.info(
         f"**{pre} de {len(registros)} lançamento(s) pré-conciliado(s) ({pre / len(registros):.0%})** — "
         f"{n_sistema} encontrado(s) no sistema (já vêm marcados) e {n_desc} com conta sugerida pela "
         "descrição de conciliações anteriores."
+        + (f" Mais **{n_possiveis} possível(is)** (⚠) para conferir." if n_possiveis else "")
     )
     st.caption(
         "**Encontrado no sistema**: venda, recebimento do fiado, despesa ou pagamento de compra com o mesmo "
-        "valor, na mesma conta e com data próxima — a conta do plano vem de lá. Para os outros (tarifa, "
-        "rendimento...), escolha a **conta do plano**. Se escolher uma conta do plano numa linha encontrada "
-        "no sistema, vale a conta escolhida. Confira e clique em Conciliar."
+        "valor, na mesma conta e com data próxima — a conta do plano vem de lá. **⚠ Possível**: mesmo valor, "
+        "mas com a data mais longe ou registrado em outra conta; se for ele mesmo, marque Conciliar (a conta do "
+        "lançamento do sistema é corrigida para a do extrato). Só escolha a **conta do plano** para o que não "
+        "foi registrado em nenhuma tela (tarifa, rendimento...) — escolher a conta do plano numa linha que existe "
+        "no sistema faz ela contar duas vezes no balancete."
     )
     if n_desc and not marcar_desc:
         st.button("Marcar também os sugeridos pela descrição", on_click=_marcar_por_descricao, key="fin_btn_desc")
@@ -196,7 +218,7 @@ def _editor_pendentes(linhas, conta_id):
             itens.append({"extrato_id": extrato_id, "plano_conta_id": conta_plano["id"]})
             incompativeis += _sinal_incompativel(r["valor"], conta_plano["tipo"])
         elif extrato_id in sistema:
-            m = sistema[extrato_id]
+            m = sistema[extrato_id]  # encontrado ou possível (marcado por quem conferiu)
             itens.append({"extrato_id": extrato_id, "movimentos": [(m["origem"], m["origem_id"], m["valor"])]})
         else:
             sem_conta += 1
@@ -348,6 +370,85 @@ def _tabela_todos(linhas):
     st.caption("Para conciliar ou desfazer, escolha Pendentes ou Conciliados acima.")
 
 
+def _secao_sem_extrato(sem_extrato):
+    """Movimentos do sistema soltos: mostra o lançamento do extrato que parece ser o
+    mesmo (inclusive os já conciliados direto no plano) e permite ligar."""
+    versao = st.session_state["fin_versao"]
+    pares = pares_no_extrato(sem_extrato)
+    com_par = sum(1 for m in sem_extrato if (m["origem"], m["origem_id"]) in pares)
+    duplicados = sum(1 for l in pares.values() if l["plano_conta_id"])
+    titulo = f"No sistema, mas ainda não ligados ao extrato: {len(sem_extrato)} lançamento(s)"
+    if com_par:
+        titulo += f" — {com_par} com par encontrado no extrato"
+    with st.expander(titulo, expanded=bool(duplicados)):
+        if duplicados:
+            st.warning(
+                f"{duplicados} desses lançamentos já estão no extrato **conciliados direto numa conta do plano** — "
+                "assim eles contam duas vezes no balancete. Ligue-os abaixo: a classificação direta é trocada "
+                "pela ligação com o lançamento do sistema."
+            )
+        st.caption(
+            "Lançamentos registrados nas contas bancárias que ainda não estão ligados ao extrato. Quando há um "
+            "lançamento de mesmo valor no extrato (até 20 dias de diferença), ele aparece em **No extrato**; os da "
+            "mesma conta já vêm marcados. Ao ligar um que foi registrado em outra conta, a conta do lançamento do "
+            "sistema é corrigida para a do extrato. Sem par: o extrato ainda não chegou nessa data, a conta não teve "
+            "extrato importado ou o valor não bateu."
+        )
+        registros = []
+        for m in sem_extrato:
+            l = pares.get((m["origem"], m["origem_id"]))
+            texto = ""
+            if l:
+                if l["plano_conta_id"]:
+                    situacao = "conciliado direto em " + rotulo_por_id_plano.get(l["plano_conta_id"], "?")
+                else:
+                    situacao = "pendente"
+                texto = f"{fmt_data(l['data'])} — {l['conta']} — {l['descricao'] or ''} ({situacao})"
+                if l["conta_financeira_id"] != m["conta_financeira_id"]:
+                    texto = "⚠ outra conta: " + texto
+            registros.append(
+                {
+                    "origem": m["origem"], "origem_id": m["origem_id"], "extrato_id": l["id"] if l else None,
+                    "ligar": bool(l) and l["conta_financeira_id"] == m["conta_financeira_id"],
+                    "data": m["data"], "conta": nome_conta_por_id.get(m["conta_financeira_id"], ""),
+                    "tipo": ORIGENS.get(m["origem"], m["origem"]), "descricao": m["descricao"],
+                    "valor": float(m["valor"]), "extrato": texto,
+                }
+            )
+        editado = st.data_editor(
+            pd.DataFrame(registros),
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled=["data", "conta", "tipo", "descricao", "valor", "extrato"],
+            key=f"fin_sem_extrato_{versao}_{inicio}_{fim}",
+            column_order=["ligar", "data", "conta", "tipo", "descricao", "valor", "extrato"],
+            column_config={
+                "origem": None, "origem_id": None, "extrato_id": None,
+                "ligar": st.column_config.CheckboxColumn("Ligar?"),
+                "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "conta": st.column_config.TextColumn("Conta registrada"),
+                "tipo": st.column_config.TextColumn("Origem"),
+                "descricao": st.column_config.TextColumn("Descrição", width="medium"),
+                "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
+                "extrato": st.column_config.TextColumn("No extrato", width="large"),
+            },
+        )
+        escolhidos = [
+            (int(r["extrato_id"]), r["origem"], int(r["origem_id"]), r["valor"])
+            for _, r in editado.iterrows()
+            if r["ligar"] and pd.notna(r["extrato_id"])
+        ]
+        marcados_sem_par = sum(1 for _, r in editado.iterrows() if r["ligar"] and pd.isna(r["extrato_id"]))
+        if marcados_sem_par:
+            st.caption(f"{marcados_sem_par} marcado(s) sem par no extrato serão ignorados.")
+        if st.button(f"Ligar {len(escolhidos)} ao extrato" if escolhidos else "Ligar ao extrato",
+                     type="primary", disabled=not escolhidos, key=f"fin_ligar_{versao}"):
+            ligados, pulados = ligar_ao_extrato(escolhidos, usuario)
+            _rerun(f"{ligados} lançamento(s) ligado(s) ao extrato.",
+                   f"{pulados} pulado(s): o lançamento do extrato já estava ligado a outro." if pulados else None)
+
+
 with aba_conc:
     opcoes_conta = {"Todas as contas": None}
     opcoes_conta.update({c["nome"]: c["id"] for c in bancos})
@@ -395,26 +496,7 @@ with aba_conc:
 
         sem_extrato = movimentos_sem_extrato(conta_id, inicio, fim)
         if sem_extrato:
-            with st.expander(f"No sistema, mas ainda não no extrato: {len(sem_extrato)} lançamento(s)"):
-                st.caption(
-                    "Lançamentos registrados nas contas bancárias que ainda não foram conciliados — o extrato "
-                    "ainda não chegou nessa data, a conta escolhida estava errada ou o valor não bateu."
-                )
-                nome_conta_por_id = {c["id"]: c["nome"] for c in todas_contas}
-                st.dataframe(
-                    [
-                        {
-                            "Data": fmt_data(m["data"]),
-                            "Conta": nome_conta_por_id.get(m["conta_financeira_id"], ""),
-                            "Origem": ORIGENS.get(m["origem"], m["origem"]),
-                            "Descrição": m["descricao"],
-                            "Valor": brl(m["valor"]),
-                        }
-                        for m in sem_extrato
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+            _secao_sem_extrato(sem_extrato)
 
 
 # ================================================================
